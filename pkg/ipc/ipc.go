@@ -4,39 +4,43 @@
 package ipc
 
 import (
-	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/sys/targets"
 )
 
 // Configuration flags for Config.Flags.
 type EnvFlags uint64
 
+// Note: New / changed flags should be added to parse_env_flags in executor.cc
 const (
-	FlagDebug            EnvFlags = 1 << iota // debug output from executor
-	FlagSignal                                // collect feedback signals (coverage)
-	FlagSandboxSetuid                         // impersonate nobody user
-	FlagSandboxNamespace                      // use namespaces for sandboxing
-	FlagEnableTun                             // initialize and use tun in executor
-	FlagEnableFault                           // enable fault injection support
-	FlagUseShmem                              // use shared memory instead of pipes for communication
-	FlagUseForkServer                         // use extended protocol with handshake
+	FlagDebug                      EnvFlags = 1 << iota // debug output from executor
+	FlagSignal                                          // collect feedback signals (coverage)
+	FlagSandboxSetuid                                   // impersonate nobody user
+	FlagSandboxNamespace                                // use namespaces for sandboxing
+	FlagSandboxAndroidUntrustedApp                      // use Android sandboxing for the untrusted_app domain
+	FlagExtraCover                                      // collect extra coverage
+	FlagEnableFault                                     // enable fault injection support
+	FlagEnableTun                                       // setup and use /dev/tun for packet injection
+	FlagEnableNetDev                                    // setup more network devices for testing
+	FlagEnableNetReset                                  // reset network namespace between programs
+	FlagEnableCgroups                                   // setup cgroups for testing
+	FlagEnableBinfmtMisc                                // setup binfmt_misc for testing
+	// Executor does not know about these:
+	FlagUseShmem      // use shared memory instead of pipes for communication
+	FlagUseForkServer // use extended protocol with handshake
 )
 
 // Per-exec flags for ExecOpts.Flags:
@@ -51,39 +55,10 @@ const (
 	FlagCollide                            // collide syscalls to provoke data races
 )
 
-const (
-	outputSize = 16 << 20
-
-	statusFail  = 67
-	statusError = 68
-	statusRetry = 69
-)
-
-var (
-	flagExecutor    = flag.String("executor", "./syz-executor", "path to executor binary")
-	flagThreaded    = flag.Bool("threaded", true, "use threaded mode in executor")
-	flagCollide     = flag.Bool("collide", true, "collide syscalls to provoke data races")
-	flagSignal      = flag.Bool("cover", true, "collect feedback signals (coverage)")
-	flagSandbox     = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace)")
-	flagDebug       = flag.Bool("debug", false, "debug output from executor")
-	flagTimeout     = flag.Duration("timeout", 0, "execution timeout")
-	flagAbortSignal = flag.Int("abort_signal", 0, "initial signal to send to executor in error conditions; upgrades to SIGKILL if executor does not exit")
-	flagBufferSize  = flag.Uint64("buffer_size", 0, "internal buffer size (in bytes) for executor output")
-	flagIPC         = flag.String("ipc", "", "ipc scheme (pipe/shmem)")
-)
-
 type ExecOpts struct {
 	Flags     ExecFlags
 	FaultCall int // call index for fault injection (0-based)
 	FaultNth  int // fault n-th operation in the call (0-based)
-}
-
-// ExecutorFailure is returned from MakeEnv or from env.Exec when executor terminates by calling fail function.
-// This is considered a logical error (a failed assert).
-type ExecutorFailure string
-
-func (err ExecutorFailure) Error() string {
-	return string(err)
 }
 
 // Config is the configuration for Env.
@@ -96,119 +71,87 @@ type Config struct {
 
 	// Timeout is the execution timeout for a single program.
 	Timeout time.Duration
-
-	// AbortSignal is the signal to send to the executor in error conditions.
-	AbortSignal int
-
-	// BufferSize is the size of the internal buffer for executor output.
-	BufferSize uint64
 }
 
-func DefaultConfig() (*Config, *ExecOpts, error) {
-	c := &Config{
-		Executor:    *flagExecutor,
-		Timeout:     *flagTimeout,
-		AbortSignal: *flagAbortSignal,
-		BufferSize:  *flagBufferSize,
-	}
-	if *flagSignal {
-		c.Flags |= FlagSignal
-	}
-	if *flagDebug {
-		c.Flags |= FlagDebug
-	}
-	switch *flagSandbox {
-	case "none":
-	case "setuid":
-		c.Flags |= FlagSandboxSetuid
-	case "namespace":
-		c.Flags |= FlagSandboxNamespace
-	default:
-		return nil, nil, fmt.Errorf("flag sandbox must contain one of none/setuid/namespace")
-	}
+type CallFlags uint32
 
-	sysTarget := targets.List[runtime.GOOS][runtime.GOARCH]
-	if sysTarget.ExecutorUsesShmem {
-		c.Flags |= FlagUseShmem
-	}
-	if sysTarget.ExecutorUsesForkServer {
-		c.Flags |= FlagUseForkServer
-	}
-	switch *flagIPC {
-	case "":
-	case "pipe":
-		c.Flags &^= FlagUseShmem
-	case "shmem":
-		c.Flags |= FlagUseShmem
-	default:
-		return nil, nil, fmt.Errorf("unknown ipc scheme: %v", *flagIPC)
-	}
-
-	opts := &ExecOpts{
-		Flags: FlagDedupCover,
-	}
-	if *flagThreaded {
-		opts.Flags |= FlagThreaded
-	}
-	if *flagCollide {
-		opts.Flags |= FlagCollide
-	}
-
-	return c, opts, nil
-}
+const (
+	CallExecuted      CallFlags = 1 << iota // was started at all
+	CallFinished                            // finished executing (rather than blocked forever)
+	CallBlocked                             // finished but blocked during execution
+	CallFaultInjected                       // fault was injected into this call
+)
 
 type CallInfo struct {
+	Flags  CallFlags
 	Signal []uint32 // feedback signal, filled if FlagSignal is set
 	Cover  []uint32 // per-call coverage, filled if FlagSignal is set and cover == true,
-	//if dedup == false, then cov effectively contains a trace, otherwise duplicates are removed
-	Comps         prog.CompMap // per-call comparison operands
-	Errno         int          // call errno (0 if the call was successful)
-	FaultInjected bool
+	// if dedup == false, then cov effectively contains a trace, otherwise duplicates are removed
+	Comps prog.CompMap // per-call comparison operands
+	Errno int          // call errno (0 if the call was successful)
+}
+
+type ProgInfo struct {
+	Calls []CallInfo
+	Extra CallInfo // stores Signal and Cover collected from background threads
 }
 
 type Env struct {
 	in  []byte
 	out []byte
 
-	cmd     *command
-	inFile  *os.File
-	outFile *os.File
-	bin     []string
-	pid     int
-	config  *Config
+	cmd       *command
+	inFile    *os.File
+	outFile   *os.File
+	bin       []string
+	linkedBin string
+	pid       int
+	config    *Config
 
 	StatExecs    uint64
 	StatRestarts uint64
 }
 
 const (
+	outputSize = 16 << 20
+
+	statusFail = 67
+
 	// Comparison types masks taken from KCOV headers.
 	compSizeMask  = 6
 	compSize8     = 6
 	compConstMask = 1
+
+	extraReplyIndex = 0xffffffff // uint32(-1)
 )
 
-func MakeEnv(config *Config, pid int) (*Env, error) {
-	const (
-		executorTimeout = 5 * time.Second
-		minTimeout      = executorTimeout + 2*time.Second
-	)
-	if config.Timeout == 0 {
-		// Executor protects against most hangs, so we use quite large timeout here.
-		// Executor can be slow due to global locks in namespaces and other things,
-		// so let's better wait than report false misleading crashes.
-		config.Timeout = time.Minute
-		if config.Flags&FlagUseForkServer == 0 {
-			// If there is no fork server, executor does not have internal timeout.
-			config.Timeout = executorTimeout
-		}
+func SandboxToFlags(sandbox string) (EnvFlags, error) {
+	switch sandbox {
+	case "none":
+		return 0, nil
+	case "setuid":
+		return FlagSandboxSetuid, nil
+	case "namespace":
+		return FlagSandboxNamespace, nil
+	case "android_untrusted_app":
+		return FlagSandboxAndroidUntrustedApp, nil
+	default:
+		return 0, fmt.Errorf("sandbox must contain one of none/setuid/namespace/android_untrusted_app")
 	}
-	// IPC timeout must be larger then executor timeout.
-	// Otherwise IPC will kill parent executor but leave child executor alive.
-	if config.Flags&FlagUseForkServer != 0 && config.Timeout < minTimeout {
-		config.Timeout = minTimeout
-	}
+}
 
+func FlagsToSandbox(flags EnvFlags) string {
+	if flags&FlagSandboxSetuid != 0 {
+		return "setuid"
+	} else if flags&FlagSandboxNamespace != 0 {
+		return "namespace"
+	} else if flags&FlagSandboxAndroidUntrustedApp != 0 {
+		return "android_untrusted_app"
+	}
+	return "none"
+}
+
+func MakeEnv(config *Config, pid int) (*Env, error) {
 	var inf, outf *os.File
 	var inmem, outmem []byte
 	if config.Flags&FlagUseShmem != 0 {
@@ -233,6 +176,7 @@ func MakeEnv(config *Config, pid int) (*Env, error) {
 		}()
 	} else {
 		inmem = make([]byte, prog.ExecBufferSize)
+		outmem = make([]byte, outputSize)
 	}
 	env := &Env{
 		in:      inmem,
@@ -249,18 +193,20 @@ func MakeEnv(config *Config, pid int) (*Env, error) {
 	env.bin[0] = osutil.Abs(env.bin[0]) // we are going to chdir
 	// Append pid to binary name.
 	// E.g. if binary is 'syz-executor' and pid=15,
-	// we create a link from 'syz-executor15' to 'syz-executor' and use 'syz-executor15' as binary.
+	// we create a link from 'syz-executor.15' to 'syz-executor' and use 'syz-executor.15' as binary.
 	// This allows to easily identify program that lead to a crash in the log.
-	// Log contains pid in "executing program 15" and crashes usually contain "Comm: syz-executor15".
+	// Log contains pid in "executing program 15" and crashes usually contain "Comm: syz-executor.15".
 	base := filepath.Base(env.bin[0])
-	pidStr := fmt.Sprint(pid)
-	if len(base)+len(pidStr) >= 16 {
-		// TASK_COMM_LEN is currently set to 16
-		base = base[:15-len(pidStr)]
+	pidStr := fmt.Sprintf(".%v", pid)
+	const maxLen = 16 // TASK_COMM_LEN is currently set to 16
+	if len(base)+len(pidStr) >= maxLen {
+		// Remove beginning of file name, in tests temp files have unique numbers at the end.
+		base = base[len(base)+len(pidStr)-maxLen+1:]
 	}
 	binCopy := filepath.Join(filepath.Dir(env.bin[0]), base+pidStr)
 	if err := os.Link(env.bin[0], binCopy); err == nil {
 		env.bin[0] = binCopy
+		env.linkedBin = binCopy
 	}
 	inf = nil
 	outf = nil
@@ -270,6 +216,9 @@ func MakeEnv(config *Config, pid int) (*Env, error) {
 func (env *Env) Close() error {
 	if env.cmd != nil {
 		env.cmd.close()
+	}
+	if env.linkedBin != "" {
+		os.Remove(env.linkedBin)
 	}
 	var err1, err2 error
 	if env.inFile != nil {
@@ -288,210 +237,240 @@ func (env *Env) Close() error {
 	}
 }
 
-var enableFaultOnce sync.Once
+var rateLimit = time.NewTicker(1 * time.Second)
 
 // Exec starts executor binary to execute program p and returns information about the execution:
 // output: process output
 // info: per-call info
-// failed: true if executor has detected a kernel bug
 // hanged: program hanged and was killed
-// err0: failed to start process, or executor has detected a logical error
-func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info []CallInfo, failed, hanged bool, err0 error) {
-	if opts.Flags&FlagInjectFault != 0 {
-		enableFaultOnce.Do(func() {
-			if err := host.EnableFaultInjection(); err != nil {
-				panic(err)
-			}
-		})
-	}
+// err0: failed to start the process or bug in executor itself
+func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info *ProgInfo, hanged bool, err0 error) {
 	// Copy-in serialized program.
 	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
-		err0 = fmt.Errorf("executor %v: failed to serialize: %v", env.pid, err)
+		err0 = fmt.Errorf("failed to serialize: %v", err)
 		return
 	}
 	var progData []byte
 	if env.config.Flags&FlagUseShmem == 0 {
 		progData = env.in[:progSize]
 	}
-	if env.out != nil {
-		// Zero out the first two words (ncmd and nsig), so that we don't have garbage there
-		// if executor crashes before writing non-garbage there.
-		for i := 0; i < 4; i++ {
-			env.out[i] = 0
-		}
+	// Zero out the first two words (ncmd and nsig), so that we don't have garbage there
+	// if executor crashes before writing non-garbage there.
+	for i := 0; i < 4; i++ {
+		env.out[i] = 0
 	}
 
 	atomic.AddUint64(&env.StatExecs, 1)
 	if env.cmd == nil {
+		if p.Target.OS == "akaros" {
+			// On akaros executor is actually ssh,
+			// starting them too frequently leads to timeouts.
+			<-rateLimit.C
+		}
 		atomic.AddUint64(&env.StatRestarts, 1)
-		env.cmd, err0 = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile)
+		env.cmd, err0 = makeCommand(env.pid, env.bin, env.config, env.inFile, env.outFile, env.out)
 		if err0 != nil {
 			return
 		}
 	}
-	var restart bool
-	output, failed, hanged, restart, err0 = env.cmd.exec(opts, progData)
-	if err0 != nil || restart {
+	output, hanged, err0 = env.cmd.exec(opts, progData)
+	if err0 != nil {
 		env.cmd.close()
 		env.cmd = nil
 		return
 	}
 
-	if env.out != nil {
-		info, err0 = env.readOutCoverage(p)
+	info, err0 = env.parseOutput(p)
+	if info != nil && env.config.Flags&FlagSignal == 0 {
+		addFallbackSignal(p, info)
+	}
+	if env.config.Flags&FlagUseForkServer == 0 {
+		env.cmd.close()
+		env.cmd = nil
 	}
 	return
 }
 
-func (env *Env) readOutCoverage(p *prog.Prog) (info []CallInfo, err0 error) {
-	out := ((*[1 << 28]uint32)(unsafe.Pointer(&env.out[0])))[:len(env.out)/int(unsafe.Sizeof(uint32(0)))]
-	readOut := func(v *uint32) bool {
-		if len(out) == 0 {
-			return false
+// addFallbackSignal computes simple fallback signal in cases we don't have real coverage signal.
+// We use syscall number or-ed with returned errno value as signal.
+// At least this gives us all combinations of syscall+errno.
+func addFallbackSignal(p *prog.Prog, info *ProgInfo) {
+	callInfos := make([]prog.CallInfo, len(info.Calls))
+	for i, inf := range info.Calls {
+		if inf.Flags&CallExecuted != 0 {
+			callInfos[i].Flags |= prog.CallExecuted
 		}
-		*v = out[0]
-		out = out[1:]
-		return true
+		if inf.Flags&CallFinished != 0 {
+			callInfos[i].Flags |= prog.CallFinished
+		}
+		if inf.Flags&CallBlocked != 0 {
+			callInfos[i].Flags |= prog.CallBlocked
+		}
+		callInfos[i].Errno = inf.Errno
 	}
+	p.FallbackSignal(callInfos)
+	for i, inf := range callInfos {
+		info.Calls[i].Signal = inf.Signal
+	}
+}
 
-	readOutAndSetErr := func(v *uint32, msg string, args ...interface{}) bool {
-		if !readOut(v) {
-			err0 = fmt.Errorf(msg, args)
-			return false
-		}
-		return true
+func (env *Env) parseOutput(p *prog.Prog) (*ProgInfo, error) {
+	out := env.out
+	ncmd, ok := readUint32(&out)
+	if !ok {
+		return nil, fmt.Errorf("failed to read number of calls")
 	}
-
-	// Reads out a 64 bits int in Little-endian as two blocks of 32 bits.
-	readOut64 := func(v *uint64, msg string, args ...interface{}) bool {
-		var a, b uint32
-		if !(readOutAndSetErr(&a, msg, args) && readOutAndSetErr(&b, msg, args)) {
-			return false
-		}
-		*v = uint64(a) + uint64(b)<<32
-		return true
-	}
-
-	var ncmd uint32
-	if !readOutAndSetErr(&ncmd,
-		"executor %v: failed to read output coverage", env.pid) {
-		return
-	}
-	info = make([]CallInfo, len(p.Calls))
-	for i := range info {
-		info[i].Errno = -1 // not executed
-	}
-	dumpCov := func() string {
-		buf := new(bytes.Buffer)
-		for i, inf := range info {
-			str := "nil"
-			if inf.Signal != nil {
-				str = fmt.Sprint(len(inf.Signal))
-			}
-			fmt.Fprintf(buf, "%v:%v|", i, str)
-		}
-		return buf.String()
-	}
+	info := &ProgInfo{Calls: make([]CallInfo, len(p.Calls))}
+	extraParts := make([]CallInfo, 0)
 	for i := uint32(0); i < ncmd; i++ {
-		var callIndex, callNum, errno, faultInjected, signalSize, coverSize, compsSize uint32
-		if !readOut(&callIndex) || !readOut(&callNum) || !readOut(&errno) || !readOut(&faultInjected) || !readOut(&signalSize) || !readOut(&coverSize) || !readOut(&compsSize) {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage", env.pid)
-			return
+		if len(out) < int(unsafe.Sizeof(callReply{})) {
+			return nil, fmt.Errorf("failed to read call %v reply", i)
 		}
-		if int(callIndex) >= len(info) {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage: record %v, call %v, total calls %v (cov: %v)",
-				env.pid, i, callIndex, len(info), dumpCov())
-			return
-		}
-		c := p.Calls[callIndex]
-		if num := c.Meta.ID; uint32(num) != callNum {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage: record %v call %v: expect syscall %v, got %v, executed %v (cov: %v)",
-				env.pid, i, callIndex, num, callNum, ncmd, dumpCov())
-			return
-		}
-		if info[callIndex].Signal != nil {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage: double coverage for call %v (cov: %v)",
-				env.pid, callIndex, dumpCov())
-			return
-		}
-		info[callIndex].Errno = int(errno)
-		info[callIndex].FaultInjected = faultInjected != 0
-		if signalSize > uint32(len(out)) {
-			err0 = fmt.Errorf("executor %v: failed to read output signal: record %v, call %v, signalsize=%v coversize=%v",
-				env.pid, i, callIndex, signalSize, coverSize)
-			return
-		}
-		// Read out signals.
-		info[callIndex].Signal = out[:signalSize:signalSize]
-		out = out[signalSize:]
-		// Read out coverage.
-		if coverSize > uint32(len(out)) {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage: record %v, call %v, signalsize=%v coversize=%v",
-				env.pid, i, callIndex, signalSize, coverSize)
-			return
-		}
-		info[callIndex].Cover = out[:coverSize:coverSize]
-		out = out[coverSize:]
-		// Read out comparisons.
-		compMap := make(prog.CompMap)
-		for j := uint32(0); j < compsSize; j++ {
-			var typ uint32
-			if !readOutAndSetErr(&typ,
-				"executor %v: failed while reading type of comparison %v/%v",
-				env.pid, callIndex, j) {
-				return
+		reply := *(*callReply)(unsafe.Pointer(&out[0]))
+		out = out[unsafe.Sizeof(callReply{}):]
+		var inf *CallInfo
+		if reply.index != extraReplyIndex {
+			if int(reply.index) >= len(info.Calls) {
+				return nil, fmt.Errorf("bad call %v index %v/%v", i, reply.index, len(info.Calls))
 			}
-			if typ > compConstMask|compSizeMask {
-				err0 = fmt.Errorf("executor %v: got wrong value (%v) while reading type of comparison %v/%v",
-					env.pid, typ, callIndex, j)
-				return
+			if num := p.Calls[reply.index].Meta.ID; int(reply.num) != num {
+				return nil, fmt.Errorf("wrong call %v num %v/%v", i, reply.num, num)
 			}
-
-			arg1ErrString := "executor %v: failed while reading op1 of comparison %v"
-			arg2ErrString := "executor %v: failed while reading op2 of comparison %v"
-			var op1, op2 uint64
-			if (typ & compSizeMask) == compSize8 {
-				if !readOut64(&op1, arg1ErrString, env.pid, j) ||
-					!readOut64(&op2, arg2ErrString, env.pid, j) {
-					return
-				}
-			} else {
-				var tmp1, tmp2 uint32
-				if !readOutAndSetErr(&tmp1, arg1ErrString, env.pid, j) ||
-					!readOutAndSetErr(&tmp2, arg2ErrString, env.pid, j) {
-					return
-				}
-				op1 = uint64(tmp1)
-				op2 = uint64(tmp2)
+			inf = &info.Calls[reply.index]
+			if inf.Flags != 0 || inf.Signal != nil {
+				return nil, fmt.Errorf("duplicate reply for call %v/%v/%v", i, reply.index, reply.num)
 			}
-			if op1 == op2 {
-				continue // it's useless to store such comparisons
-			}
-			compMap.AddComp(op2, op1)
-			if (typ & compConstMask) != 0 {
-				// If one of the operands was const, then this operand is always
-				// placed first in the instrumented callbacks. Such an operand
-				// could not be an argument of our syscalls (because otherwise
-				// it wouldn't be const), thus we simply ignore it.
-				continue
-			}
-			compMap.AddComp(op1, op2)
+			inf.Errno = int(reply.errno)
+			inf.Flags = CallFlags(reply.flags)
+		} else {
+			extraParts = append(extraParts, CallInfo{})
+			inf = &extraParts[len(extraParts)-1]
 		}
-		info[callIndex].Comps = compMap
+		if inf.Signal, ok = readUint32Array(&out, reply.signalSize); !ok {
+			return nil, fmt.Errorf("call %v/%v/%v: signal overflow: %v/%v",
+				i, reply.index, reply.num, reply.signalSize, len(out))
+		}
+		if inf.Cover, ok = readUint32Array(&out, reply.coverSize); !ok {
+			return nil, fmt.Errorf("call %v/%v/%v: cover overflow: %v/%v",
+				i, reply.index, reply.num, reply.coverSize, len(out))
+		}
+		comps, err := readComps(&out, reply.compsSize)
+		if err != nil {
+			return nil, err
+		}
+		inf.Comps = comps
 	}
-	return
+	if len(extraParts) == 0 {
+		return info, nil
+	}
+	info.Extra = convertExtra(extraParts)
+	return info, nil
+}
+
+func convertExtra(extraParts []CallInfo) CallInfo {
+	var extra CallInfo
+	extraCover := make(cover.Cover)
+	extraSignal := make(signal.Signal)
+	for _, part := range extraParts {
+		extraCover.Merge(part.Cover)
+		extraSignal.Merge(signal.FromRaw(part.Signal, 0))
+	}
+	extra.Cover = extraCover.Serialize()
+	extra.Signal = make([]uint32, len(extraSignal))
+	i := 0
+	for s := range extraSignal {
+		extra.Signal[i] = uint32(s)
+		i++
+	}
+	return extra
+}
+
+func readComps(outp *[]byte, compsSize uint32) (prog.CompMap, error) {
+	if compsSize == 0 {
+		return nil, nil
+	}
+	compMap := make(prog.CompMap)
+	for i := uint32(0); i < compsSize; i++ {
+		typ, ok := readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read comp %v", i)
+		}
+		if typ > compConstMask|compSizeMask {
+			return nil, fmt.Errorf("bad comp %v type %v", i, typ)
+		}
+		var op1, op2 uint64
+		var ok1, ok2 bool
+		if typ&compSizeMask == compSize8 {
+			op1, ok1 = readUint64(outp)
+			op2, ok2 = readUint64(outp)
+		} else {
+			var tmp1, tmp2 uint32
+			tmp1, ok1 = readUint32(outp)
+			tmp2, ok2 = readUint32(outp)
+			op1, op2 = uint64(tmp1), uint64(tmp2)
+		}
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("failed to read comp %v op", i)
+		}
+		if op1 == op2 {
+			continue // it's useless to store such comparisons
+		}
+		compMap.AddComp(op2, op1)
+		if (typ & compConstMask) != 0 {
+			// If one of the operands was const, then this operand is always
+			// placed first in the instrumented callbacks. Such an operand
+			// could not be an argument of our syscalls (because otherwise
+			// it wouldn't be const), thus we simply ignore it.
+			continue
+		}
+		compMap.AddComp(op1, op2)
+	}
+	return compMap, nil
+}
+
+func readUint32(outp *[]byte) (uint32, bool) {
+	out := *outp
+	if len(out) < 4 {
+		return 0, false
+	}
+	v := *(*uint32)(unsafe.Pointer(&out[0]))
+	*outp = out[4:]
+	return v, true
+}
+
+func readUint64(outp *[]byte) (uint64, bool) {
+	out := *outp
+	if len(out) < 8 {
+		return 0, false
+	}
+	v := *(*uint64)(unsafe.Pointer(&out[0]))
+	*outp = out[8:]
+	return v, true
+}
+
+func readUint32Array(outp *[]byte, size uint32) ([]uint32, bool) {
+	out := *outp
+	if int(size)*4 > len(out) {
+		return nil, false
+	}
+	arr := ((*[1 << 28]uint32)(unsafe.Pointer(&out[0])))
+	res := arr[:size:size]
+	*outp = out[size*4:]
+	return res, true
 }
 
 type command struct {
 	pid      int
 	config   *Config
+	timeout  time.Duration
 	cmd      *exec.Cmd
 	dir      string
 	readDone chan []byte
 	exited   chan struct{}
 	inrp     *os.File
 	outwp    *os.File
+	outmem   []byte
 }
 
 const (
@@ -528,31 +507,30 @@ type executeReply struct {
 	status uint32
 }
 
-// TODO(dvyukov): we currently parse this manually, should cast output to this struct instead.
-/*
 type callReply struct {
-	callIndex     uint32
-	callNum       uint32
-	errno         uint32
-	blocked       uint32
-	faultInjected uint32
-	signalSize    uint32
-	coverSize     uint32
-	compsSize     uint32
+	index      uint32 // call index in the program
+	num        uint32 // syscall number (for cross-checking)
+	errno      uint32
+	flags      uint32 // see CallFlags
+	signalSize uint32
+	coverSize  uint32
+	compsSize  uint32
 	// signal/cover/comps follow
 }
-*/
 
-func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile *os.File) (*command, error) {
+func makeCommand(pid int, bin []string, config *Config, inFile, outFile *os.File, outmem []byte) (*command, error) {
 	dir, err := ioutil.TempDir("./", "syzkaller-testdir")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %v", err)
 	}
+	dir = osutil.Abs(dir)
 
 	c := &command{
-		pid:    pid,
-		config: config,
-		dir:    dir,
+		pid:     pid,
+		config:  config,
+		timeout: sanitizeTimeout(config),
+		dir:     dir,
+		outmem:  outmem,
 	}
 	defer func() {
 		if c != nil {
@@ -560,7 +538,7 @@ func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile
 		}
 	}()
 
-	if config.Flags&(FlagSandboxSetuid|FlagSandboxNamespace) != 0 {
+	if config.Flags&(FlagSandboxSetuid|FlagSandboxNamespace|FlagSandboxAndroidUntrustedApp) != 0 {
 		if err := os.Chmod(dir, 0777); err != nil {
 			return nil, fmt.Errorf("failed to chmod temp dir: %v", err)
 		}
@@ -610,10 +588,7 @@ func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile
 		cmd.Stderr = wp
 		go func(c *command) {
 			// Read out output in case executor constantly prints something.
-			bufSize := c.config.BufferSize
-			if bufSize == 0 {
-				bufSize = 128 << 10
-			}
+			const bufSize = 128 << 10
 			output := make([]byte, bufSize)
 			var size uint64
 			for {
@@ -639,6 +614,9 @@ func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile
 	}
 	c.cmd = cmd
 	wp.Close()
+	// Note: we explicitly close inwp before calling handshake even though we defer it above.
+	// If we don't do it and executor exits before writing handshake reply,
+	// reading from inrp will hang since we hold another end of the pipe open.
 	inwp.Close()
 
 	if c.config.Flags&FlagUseForkServer != 0 {
@@ -653,11 +631,10 @@ func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile
 
 func (c *command) close() {
 	if c.cmd != nil {
-		c.abort()
+		c.cmd.Process.Kill()
 		c.wait()
 	}
-	osutil.UmountAll(c.dir)
-	os.RemoveAll(c.dir)
+	osutil.RemoveAll(c.dir)
 	if c.inrp != nil {
 		c.inrp.Close()
 	}
@@ -666,7 +643,7 @@ func (c *command) close() {
 	}
 }
 
-// handshake sends handshakeReq and waits for handshakeReply (sandbox setup can take significant time).
+// handshake sends handshakeReq and waits for handshakeReply.
 func (c *command) handshake() error {
 	req := &handshakeReq{
 		magic: inMagic,
@@ -692,6 +669,7 @@ func (c *command) handshake() error {
 		}
 		read <- nil
 	}()
+	// Sandbox setup can take significant time.
 	timeout := time.NewTimer(time.Minute)
 	select {
 	case err := <-read:
@@ -706,33 +684,11 @@ func (c *command) handshake() error {
 }
 
 func (c *command) handshakeError(err error) error {
-	c.abort()
+	c.cmd.Process.Kill()
 	output := <-c.readDone
 	err = fmt.Errorf("executor %v: %v\n%s", c.pid, err, output)
 	c.wait()
-	if c.cmd.ProcessState != nil {
-		// Magic values returned by executor.
-		if osutil.ProcessExitStatus(c.cmd.ProcessState) == statusFail {
-			err = ExecutorFailure(err.Error())
-		}
-	}
 	return err
-}
-
-// abort sends the abort signal to the command and then SIGKILL if wait doesn't return within 5s.
-func (c *command) abort() {
-	if osutil.ProcessSignal(c.cmd.Process, c.config.AbortSignal) {
-		return
-	}
-	go func() {
-		t := time.NewTimer(5 * time.Second)
-		select {
-		case <-t.C:
-			c.cmd.Process.Kill()
-		case <-c.exited:
-			t.Stop()
-		}
-	}()
 }
 
 func (c *command) wait() error {
@@ -746,8 +702,7 @@ func (c *command) wait() error {
 	return err
 }
 
-func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, hanged,
-	restart bool, err0 error) {
+func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged bool, err0 error) {
 	req := &executeReq{
 		magic:     inMagic,
 		envFlags:  uint64(c.config.Flags),
@@ -775,80 +730,93 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 	done := make(chan bool)
 	hang := make(chan bool)
 	go func() {
-		t := time.NewTimer(c.config.Timeout)
+		t := time.NewTimer(c.timeout)
 		select {
 		case <-t.C:
-			c.abort()
+			c.cmd.Process.Kill()
 			hang <- true
 		case <-done:
 			t.Stop()
 			hang <- false
 		}
 	}()
-	var exitStatus int
-	if c.config.Flags&FlagUseForkServer == 0 {
-		restart = true
-		c.cmd.Wait()
-		close(done)
-		<-hang
-		exitStatus = osutil.ProcessExitStatus(c.cmd.ProcessState)
-	} else {
+	exitStatus := -1
+	completedCalls := (*uint32)(unsafe.Pointer(&c.outmem[0]))
+	outmem := c.outmem[4:]
+	for {
 		reply := &executeReply{}
 		replyData := (*[unsafe.Sizeof(*reply)]byte)(unsafe.Pointer(reply))[:]
-		_, readErr := io.ReadFull(c.inrp, replyData)
-		close(done)
-		if readErr == nil {
-			if reply.magic != outMagic {
-				panic(fmt.Sprintf("executor %v: got bad reply magic 0x%x", c.pid, reply.magic))
-			}
-			if reply.done == 0 {
-				// TODO: call completion/coverage over the control pipe is not supported yet.
-				panic(fmt.Sprintf("executor %v: got call reply", c.pid))
-			}
-			if reply.status == 0 {
-				// Program was OK.
-				<-hang
-				return
-			}
-			// Executor writes magic values into the pipe before exiting,
-			// so proceed with killing and joining it.
+		if _, err := io.ReadFull(c.inrp, replyData); err != nil {
+			break
 		}
-		c.abort()
-		output = <-c.readDone
-		if err := c.wait(); <-hang {
-			hanged = true
-			// In all likelihood, this will be duplicated by the default
-			// case below, but that's fine.
-			output = append(output, []byte(err.Error())...)
-			output = append(output, '\n')
+		if reply.magic != outMagic {
+			fmt.Fprintf(os.Stderr, "executor %v: got bad reply magic 0x%x\n", c.pid, reply.magic)
+			os.Exit(1)
 		}
-		exitStatus = int(reply.status)
+		if reply.done != 0 {
+			exitStatus = int(reply.status)
+			break
+		}
+		callReply := &callReply{}
+		callReplyData := (*[unsafe.Sizeof(*callReply)]byte)(unsafe.Pointer(callReply))[:]
+		if _, err := io.ReadFull(c.inrp, callReplyData); err != nil {
+			break
+		}
+		if callReply.signalSize != 0 || callReply.coverSize != 0 || callReply.compsSize != 0 {
+			// This is unsupported yet.
+			fmt.Fprintf(os.Stderr, "executor %v: got call reply with coverage\n", c.pid)
+			os.Exit(1)
+		}
+		copy(outmem, callReplyData)
+		outmem = outmem[len(callReplyData):]
+		*completedCalls++
 	}
-	// Handle magic values returned by executor.
-	switch exitStatus {
-	case statusFail:
-		err0 = ExecutorFailure(fmt.Sprintf("executor %v: failed: %s", c.pid, output))
-	case statusError:
-		err0 = fmt.Errorf("executor %v: detected kernel bug", c.pid)
-		failed = true
-	case statusRetry:
-		// This is a temporal error (ENOMEM) or an unfortunate
-		// program that messes with testing setup (e.g. kills executor
-		// loop process). Pretend that nothing happened.
-		// It's better than a false crash report.
-		err0 = nil
-		hanged = false
-		restart = true
-	default:
-		if c.config.Flags&FlagUseForkServer == 0 {
-			return
-		}
-		// Failed to get a valid (or perhaps any) status from the executor.
-		//
-		// Once the executor is serving the status is always written to
-		// the pipe, so we don't bother to check the specific exit codes from wait.
-		err0 = fmt.Errorf("executor %v: invalid status %d, exit status: %s",
-			c.pid, exitStatus, c.cmd.ProcessState)
+	close(done)
+	if exitStatus == 0 {
+		// Program was OK.
+		<-hang
+		return
+	}
+	c.cmd.Process.Kill()
+	output = <-c.readDone
+	if err := c.wait(); <-hang {
+		hanged = true
+		output = append(output, []byte(err.Error())...)
+		output = append(output, '\n')
+		return
+	}
+	if exitStatus == -1 {
+		exitStatus = osutil.ProcessExitStatus(c.cmd.ProcessState)
+	}
+	// Ignore all other errors.
+	// Without fork server executor can legitimately exit (program contains exit_group),
+	// with fork server the top process can exit with statusFail if it wants special handling.
+	if exitStatus == statusFail {
+		err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
 	}
 	return
+}
+
+func sanitizeTimeout(config *Config) time.Duration {
+	const (
+		executorTimeout = 5 * time.Second
+		minTimeout      = executorTimeout + 2*time.Second
+	)
+	timeout := config.Timeout
+	if timeout == 0 {
+		// Executor protects against most hangs, so we use quite large timeout here.
+		// Executor can be slow due to global locks in namespaces and other things,
+		// so let's better wait than report false misleading crashes.
+		timeout = time.Minute
+		if config.Flags&FlagUseForkServer == 0 {
+			// If there is no fork server, executor does not have internal timeout.
+			timeout = executorTimeout
+		}
+	}
+	// IPC timeout must be larger then executor timeout.
+	// Otherwise IPC will kill parent executor but leave child executor alive.
+	if config.Flags&FlagUseForkServer != 0 && timeout < minTimeout {
+		timeout = minTimeout
+	}
+	return timeout
 }

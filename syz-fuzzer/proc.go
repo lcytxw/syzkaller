@@ -16,8 +16,8 @@ import (
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/ipc"
-	. "github.com/google/syzkaller/pkg/log"
-	. "github.com/google/syzkaller/pkg/rpctype"
+	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
 )
@@ -64,6 +64,12 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 }
 
 func (proc *Proc) loop() {
+	generatePeriod := 100
+	if proc.fuzzer.config.Flags&ipc.FlagSignal == 0 {
+		// If we don't have real coverage signal, generate programs more frequently
+		// because fallback signal is weak.
+		generatePeriod = 2
+	}
 	for i := 0; ; i++ {
 		item := proc.fuzzer.workQueue.dequeue()
 		if item != nil {
@@ -75,41 +81,44 @@ func (proc *Proc) loop() {
 			case *WorkSmash:
 				proc.smashInput(item)
 			default:
-				panic("unknown work type")
+				log.Fatalf("unknown work type: %#v", item)
 			}
 			continue
 		}
 
 		ct := proc.fuzzer.choiceTable
 		corpus := proc.fuzzer.corpusSnapshot()
-		if len(corpus) == 0 || i%100 == 0 {
+		if len(corpus) == 0 || i%generatePeriod == 0 {
 			// Generate a new prog.
 			p := proc.fuzzer.target.Generate(proc.rnd, programLength, ct)
-			Logf(1, "#%v: generated", proc.pid)
+			log.Logf(1, "#%v: generated", proc.pid)
 			proc.execute(proc.execOpts, p, ProgNormal, StatGenerate)
 		} else {
 			// Mutate an existing prog.
 			p := corpus[proc.rnd.Intn(len(corpus))].Clone()
 			p.Mutate(proc.rnd, programLength, ct, corpus)
-			Logf(1, "#%v: mutated", proc.pid)
+			log.Logf(1, "#%v: mutated", proc.pid)
 			proc.execute(proc.execOpts, p, ProgNormal, StatFuzz)
 		}
 	}
 }
 
 func (proc *Proc) triageInput(item *WorkTriage) {
-	Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
-	if !proc.fuzzer.coverageEnabled {
-		panic("should not be called when coverage is disabled")
-	}
+	log.Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
 
-	call := item.p.Calls[item.call]
-	inputSignal := signal.FromRaw(item.info.Signal, signalPrio(item.p.Target, call, &item.info))
+	prio := signalPrio(item.p, &item.info, item.call)
+	inputSignal := signal.FromRaw(item.info.Signal, prio)
 	newSignal := proc.fuzzer.corpusSignalDiff(inputSignal)
 	if newSignal.Empty() {
 		return
 	}
-	Logf(3, "triaging input for %v (new signal=%v)", call.Meta.CallName, newSignal.Len())
+	callName := ".extra"
+	logCallName := "extra"
+	if item.call != -1 {
+		callName = item.p.Calls[item.call].Meta.CallName
+		logCallName = fmt.Sprintf("call #%v %v", item.call, callName)
+	}
+	log.Logf(3, "triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
 	var inputCover cover.Cover
 	const (
 		signalRuns       = 3
@@ -119,40 +128,33 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	for i := 0; i < signalRuns; i++ {
 		info := proc.executeRaw(proc.execOptsCover, item.p, StatTriage)
-		if len(info) == 0 || len(info[item.call].Signal) == 0 {
-			// The call was not executed. Happens sometimes.
+		if !reexecutionSuccess(info, &item.info, item.call) {
+			// The call was not executed or failed.
 			notexecuted++
-			if notexecuted > signalRuns/2 {
+			if notexecuted > signalRuns/2+1 {
 				return // if happens too often, give up
 			}
 			continue
 		}
-		inf := info[item.call]
-		thisSignal := signal.FromRaw(inf.Signal, signalPrio(item.p.Target, call, &inf))
+		thisSignal, thisCover := getSignalAndCover(item.p, info, item.call)
 		newSignal = newSignal.Intersection(thisSignal)
 		// Without !minimized check manager starts losing some considerable amount
 		// of coverage after each restart. Mechanics of this are not completely clear.
 		if newSignal.Empty() && item.flags&ProgMinimized == 0 {
 			return
 		}
-		inputCover.Merge(inf.Cover)
+		inputCover.Merge(thisCover)
 	}
 	if item.flags&ProgMinimized == 0 {
 		item.p, item.call = prog.Minimize(item.p, item.call, false,
 			func(p1 *prog.Prog, call1 int) bool {
 				for i := 0; i < minimizeAttempts; i++ {
 					info := proc.execute(proc.execOptsNoCollide, p1, ProgNormal, StatMinimize)
-					if len(info) == 0 || len(info[call1].Signal) == 0 {
-						continue // The call was not executed.
+					if !reexecutionSuccess(info, &item.info, call1) {
+						// The call was not executed or failed.
+						continue
 					}
-					inf := info[call1]
-					if item.info.Errno == 0 && inf.Errno != 0 {
-						// Don't minimize calls from successful to unsuccessful.
-						// Successful calls are much more valuable.
-						return false
-					}
-					prio := signalPrio(p1.Target, p1.Calls[call1], &inf)
-					thisSignal := signal.FromRaw(inf.Signal, prio)
+					thisSignal, _ := getSignalAndCover(p1, info, call1)
 					if newSignal.Intersection(thisSignal).Len() == newSignal.Len() {
 						return true
 					}
@@ -164,9 +166,9 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	data := item.p.Serialize()
 	sig := hash.Hash(data)
 
-	Logf(2, "added new input for %v to corpus:\n%s", call.Meta.CallName, data)
-	proc.fuzzer.sendInputToManager(RPCInput{
-		Call:   call.Meta.CallName,
+	log.Logf(2, "added new input for %v to corpus:\n%s", logCallName, data)
+	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
+		Call:   callName,
 		Prog:   data,
 		Signal: inputSignal.Serialize(),
 		Cover:  inputCover.Serialize(),
@@ -179,38 +181,61 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	}
 }
 
+func reexecutionSuccess(info *ipc.ProgInfo, oldInfo *ipc.CallInfo, call int) bool {
+	if info == nil || len(info.Calls) == 0 {
+		return false
+	}
+	if call != -1 {
+		// Don't minimize calls from successful to unsuccessful.
+		// Successful calls are much more valuable.
+		if oldInfo.Errno == 0 && info.Calls[call].Errno != 0 {
+			return false
+		}
+		return len(info.Calls[call].Signal) != 0
+	}
+	return len(info.Extra.Signal) != 0
+}
+
+func getSignalAndCover(p *prog.Prog, info *ipc.ProgInfo, call int) (signal.Signal, []uint32) {
+	inf := &info.Extra
+	if call != -1 {
+		inf = &info.Calls[call]
+	}
+	return signal.FromRaw(inf.Signal, signalPrio(p, inf, call)), inf.Cover
+}
+
 func (proc *Proc) smashInput(item *WorkSmash) {
-	if proc.fuzzer.faultInjectionEnabled {
+	if proc.fuzzer.faultInjectionEnabled && item.call != -1 {
 		proc.failCall(item.p, item.call)
 	}
-	if proc.fuzzer.comparisonTracingEnabled {
+	if proc.fuzzer.comparisonTracingEnabled && item.call != -1 {
 		proc.executeHintSeed(item.p, item.call)
 	}
 	corpus := proc.fuzzer.corpusSnapshot()
 	for i := 0; i < 100; i++ {
 		p := item.p.Clone()
 		p.Mutate(proc.rnd, programLength, proc.fuzzer.choiceTable, corpus)
-		Logf(1, "#%v: smash mutated", proc.pid)
+		log.Logf(1, "#%v: smash mutated", proc.pid)
 		proc.execute(proc.execOpts, p, ProgNormal, StatSmash)
 	}
 }
 
 func (proc *Proc) failCall(p *prog.Prog, call int) {
 	for nth := 0; nth < 100; nth++ {
-		Logf(1, "#%v: injecting fault into call %v/%v", proc.pid, call, nth)
+		log.Logf(1, "#%v: injecting fault into call %v/%v", proc.pid, call, nth)
 		opts := *proc.execOpts
 		opts.Flags |= ipc.FlagInjectFault
 		opts.FaultCall = call
 		opts.FaultNth = nth
 		info := proc.executeRaw(&opts, p, StatSmash)
-		if info != nil && len(info) > call && !info[call].FaultInjected {
+		if info != nil && len(info.Calls) > call && info.Calls[call].Flags&ipc.CallFaultInjected == 0 {
 			break
 		}
 	}
 }
 
 func (proc *Proc) executeHintSeed(p *prog.Prog, call int) {
-	Logf(1, "#%v: collecting comparisons", proc.pid)
+	log.Logf(1, "#%v: collecting comparisons", proc.pid)
 	// First execute the original program to dump comparisons from KCOV.
 	info := proc.execute(proc.execOptsComps, p, ProgNormal, StatSeed)
 	if info == nil {
@@ -220,34 +245,41 @@ func (proc *Proc) executeHintSeed(p *prog.Prog, call int) {
 	// Then mutate the initial program for every match between
 	// a syscall argument and a comparison operand.
 	// Execute each of such mutants to check if it gives new coverage.
-	p.MutateWithHints(call, info[call].Comps, func(p *prog.Prog) {
-		Logf(1, "#%v: executing comparison hint", proc.pid)
+	p.MutateWithHints(call, info.Calls[call].Comps, func(p *prog.Prog) {
+		log.Logf(1, "#%v: executing comparison hint", proc.pid)
 		proc.execute(proc.execOpts, p, ProgNormal, StatHint)
 	})
 }
 
-func (proc *Proc) execute(execOpts *ipc.ExecOpts, p *prog.Prog, flags ProgTypes, stat Stat) []ipc.CallInfo {
+func (proc *Proc) execute(execOpts *ipc.ExecOpts, p *prog.Prog, flags ProgTypes, stat Stat) *ipc.ProgInfo {
 	info := proc.executeRaw(execOpts, p, stat)
-	for _, callIndex := range proc.fuzzer.checkNewSignal(p, info) {
-		info := info[callIndex]
-		// info.Signal points to the output shmem region, detach it before queueing.
-		info.Signal = append([]uint32{}, info.Signal...)
-		// None of the caller use Cover, so just nil it instead of detaching.
-		// Note: triage input uses executeRaw to get coverage.
-		info.Cover = nil
-		proc.fuzzer.workQueue.enqueue(&WorkTriage{
-			p:     p.Clone(),
-			call:  callIndex,
-			info:  info,
-			flags: flags,
-		})
+	calls, extra := proc.fuzzer.checkNewSignal(p, info)
+	for _, callIndex := range calls {
+		proc.enqueueCallTriage(p, flags, callIndex, info.Calls[callIndex])
+	}
+	if extra {
+		proc.enqueueCallTriage(p, flags, -1, info.Extra)
 	}
 	return info
 }
 
-func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) []ipc.CallInfo {
+func (proc *Proc) enqueueCallTriage(p *prog.Prog, flags ProgTypes, callIndex int, info ipc.CallInfo) {
+	// info.Signal points to the output shmem region, detach it before queueing.
+	info.Signal = append([]uint32{}, info.Signal...)
+	// None of the caller use Cover, so just nil it instead of detaching.
+	// Note: triage input uses executeRaw to get coverage.
+	info.Cover = nil
+	proc.fuzzer.workQueue.enqueue(&WorkTriage{
+		p:     p.Clone(),
+		call:  callIndex,
+		info:  info,
+		flags: flags,
+	})
+}
+
+func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.ProgInfo {
 	if opts.Flags&ipc.FlagDedupCover == 0 {
-		panic("dedup cover is not enabled")
+		log.Fatalf("dedup cover is not enabled")
 	}
 
 	// Limit concurrency window and do leak checking once in a while.
@@ -255,28 +287,21 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) []ipc.
 	defer proc.fuzzer.gate.Leave(ticket)
 
 	proc.logProgram(opts, p)
-	try := 0
-retry:
-	atomic.AddUint64(&proc.fuzzer.stats[stat], 1)
-	output, info, failed, hanged, err := proc.env.Exec(opts, p)
-	if failed {
-		// BUG in output should be recognized by manager.
-		Logf(0, "BUG: executor-detected bug:\n%s", output)
-		// Don't return any cover so that the input is not added to corpus.
-		return nil
-	}
-	if err != nil {
-		if _, ok := err.(ipc.ExecutorFailure); ok || try > 10 {
-			panic(err)
+	for try := 0; ; try++ {
+		atomic.AddUint64(&proc.fuzzer.stats[stat], 1)
+		output, info, hanged, err := proc.env.Exec(opts, p)
+		if err != nil {
+			if try > 10 {
+				log.Fatalf("executor %v failed %v times:\n%v", proc.pid, try, err)
+			}
+			log.Logf(4, "fuzzer detected executor failure='%v', retrying #%d", err, try+1)
+			debug.FreeOSMemory()
+			time.Sleep(time.Second)
+			continue
 		}
-		try++
-		Logf(4, "fuzzer detected executor failure='%v', retrying #%d\n", err, (try + 1))
-		debug.FreeOSMemory()
-		time.Sleep(time.Second)
-		goto retry
+		log.Logf(2, "result hanged=%v: %s", hanged, output)
+		return info
 	}
-	Logf(2, "result failed=%v hanged=%v: %v\n", failed, hanged, string(output))
-	return info
 }
 
 func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {
@@ -294,8 +319,11 @@ func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {
 	// It must not be intermixed.
 	switch proc.fuzzer.outputType {
 	case OutputStdout:
+		now := time.Now()
 		proc.fuzzer.logMu.Lock()
-		Logf(0, "executing program %v%v:\n%s\n", proc.pid, strOpts, data)
+		fmt.Printf("%02v:%02v:%02v executing program %v%v:\n%s\n",
+			now.Hour(), now.Minute(), now.Second(),
+			proc.pid, strOpts, data)
 		proc.fuzzer.logMu.Unlock()
 	case OutputDmesg:
 		fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY, 0)
@@ -316,6 +344,6 @@ func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {
 			f.Close()
 		}
 	default:
-		panic("unknown output type")
+		log.Fatalf("unknown output type: %v", proc.fuzzer.outputType)
 	}
 }

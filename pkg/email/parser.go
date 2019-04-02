@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/mail"
 	"regexp"
 	"sort"
@@ -24,15 +25,32 @@ type Email struct {
 	Subject     string
 	From        string
 	Cc          []string
-	Body        string // text/plain part
-	Patch       string // attached patch, if any
-	Command     string // command to bot (#syz is stripped)
-	CommandArgs string // arguments for the command
+	Body        string  // text/plain part
+	Patch       string  // attached patch, if any
+	Command     Command // command to bot
+	CommandArgs string  // arguments for the command
 }
+
+type Command int
+
+const (
+	CmdUnknown Command = iota
+	CmdNone
+	CmdUpstream
+	CmdFix
+	CmdDup
+	CmdUnDup
+	CmdTest
+	CmdInvalid
+	CmdUnCC
+
+	cmdTest5
+)
 
 const commandPrefix = "#syz "
 
-var groupsLinkRe = regexp.MustCompile("\nTo view this discussion on the web visit (https://groups\\.google\\.com/.*?)\\.(?:\r)?\n")
+var groupsLinkRe = regexp.MustCompile("\nTo view this discussion on the web visit" +
+	" (https://groups\\.google\\.com/.*?)\\.(?:\r)?\n")
 
 func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 	msg, err := mail.ReadMessage(r)
@@ -85,7 +103,8 @@ func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 		return nil, err
 	}
 	bodyStr := string(body)
-	patch, cmd, cmdArgs := "", "", ""
+	cmd := CmdNone
+	patch, cmdArgs := "", ""
 	if !fromMe {
 		for _, a := range attachments {
 			_, patch, _ = ParsePatch(string(a))
@@ -174,9 +193,10 @@ func CanonicalEmail(email string) string {
 // extractCommand extracts command to syzbot from email body.
 // Commands are of the following form:
 // ^#syz cmd args...
-func extractCommand(body []byte) (cmd, args string) {
+func extractCommand(body []byte) (cmd Command, args string) {
 	cmdPos := bytes.Index(append([]byte{'\n'}, body...), []byte("\n"+commandPrefix))
 	if cmdPos == -1 {
+		cmd = CmdNone
 		return
 	}
 	cmdPos += len(commandPrefix)
@@ -193,18 +213,41 @@ func extractCommand(body []byte) (cmd, args string) {
 	if cmdEnd1 := bytes.IndexByte(body[cmdPos:], ' '); cmdEnd1 != -1 && cmdEnd1 < cmdEnd {
 		cmdEnd = cmdEnd1
 	}
-	cmd = string(body[cmdPos : cmdPos+cmdEnd])
+	switch string(body[cmdPos : cmdPos+cmdEnd]) {
+	default:
+		cmd = CmdUnknown
+	case "":
+		cmd = CmdNone
+	case "upstream":
+		cmd = CmdUpstream
+	case "fix", "fix:":
+		cmd = CmdFix
+	case "dup", "dup:":
+		cmd = CmdDup
+	case "undup":
+		cmd = CmdUnDup
+	case "test", "test:":
+		cmd = CmdTest
+	case "invalid":
+		cmd = CmdInvalid
+	case "uncc", "uncc:":
+		cmd = CmdUnCC
+	case "test_5_arg_cmd":
+		cmd = cmdTest5
+	}
 	// Some email clients split text emails at 80 columns are the transformation is irrevesible.
 	// We try hard to restore what was there before.
 	// For "test:" command we know that there must be 2 tokens without spaces.
 	// For "fix:"/"dup:" we need a whole non-empty line of text.
 	switch cmd {
-	case "test:":
+	case CmdTest:
 		args = extractArgsTokens(body[cmdPos+cmdEnd:], 2)
-	case "test_5_arg_cmd":
+	case cmdTest5:
 		args = extractArgsTokens(body[cmdPos+cmdEnd:], 5)
-	case "fix:", "dup:":
+	case CmdFix, CmdDup:
 		args = extractArgsLine(body[cmdPos+cmdEnd:])
+	case CmdUnknown:
+		args = extractArgsLine(body[cmdPos:])
 	}
 	return
 }
@@ -245,18 +288,21 @@ func extractArgsLine(body []byte) string {
 	return strings.TrimSpace(string(body[pos : pos+lineEnd]))
 }
 
-func parseBody(r io.Reader, headers mail.Header) (body []byte, attachments [][]byte, err error) {
+func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 	// git-send-email sends emails without Content-Type, let's assume it's text.
 	mediaType := "text/plain"
 	var params map[string]string
 	if contentType := headers.Get("Content-Type"); contentType != "" {
+		var err error
 		mediaType, params, err = mime.ParseMediaType(headers.Get("Content-Type"))
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to parse email header 'Content-Type': %v", err)
 		}
 	}
-	// Note: mime package handles quoted-printable internally.
-	if strings.ToLower(headers.Get("Content-Transfer-Encoding")) == "base64" {
+	switch strings.ToLower(headers.Get("Content-Transfer-Encoding")) {
+	case "quoted-printable":
+		r = quotedprintable.NewReader(r)
+	case "base64":
 		r = base64.NewDecoder(base64.StdEncoding, r)
 	}
 	disp, _, _ := mime.ParseMediaType(headers.Get("Content-Disposition"))
@@ -277,6 +323,8 @@ func parseBody(r io.Reader, headers mail.Header) (body []byte, attachments [][]b
 	if !strings.HasPrefix(mediaType, "multipart/") {
 		return nil, nil, nil
 	}
+	var body []byte
+	var attachments [][]byte
 	mr := multipart.NewReader(r, params["boundary"])
 	for {
 		p, err := mr.NextPart()
@@ -320,6 +368,17 @@ func MergeEmailLists(lists ...[]string) []string {
 	sort.Strings(result)
 	if len(result) > maxEmails {
 		result = result[:maxEmails]
+	}
+	return result
+}
+
+func RemoveFromEmailList(list []string, toRemove string) []string {
+	var result []string
+	toRemove = CanonicalEmail(toRemove)
+	for _, email := range list {
+		if CanonicalEmail(email) != toRemove {
+			result = append(result, email)
+		}
 	}
 	return result
 }

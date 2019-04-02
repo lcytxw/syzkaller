@@ -35,15 +35,16 @@ type ExecArg interface{} // one of ExecArg*
 
 type ExecArgConst struct {
 	Size           uint64
+	Format         BinaryFormat
 	Value          uint64
 	BitfieldOffset uint64
 	BitfieldLength uint64
 	PidStride      uint64
-	BigEndian      bool
 }
 
 type ExecArgResult struct {
 	Size    uint64
+	Format  BinaryFormat
 	Index   uint64
 	DivOp   uint64
 	AddOp   uint64
@@ -51,7 +52,8 @@ type ExecArgResult struct {
 }
 
 type ExecArgData struct {
-	Data []byte
+	Data     []byte
+	Readable bool
 }
 
 type ExecArgCsum struct {
@@ -139,14 +141,16 @@ func (dec *execDecoder) readArg() ExecArg {
 		return ExecArgConst{
 			Value:          dec.read(),
 			Size:           meta & 0xff,
+			Format:         BinaryFormat((meta >> 8) & 0xff),
 			BitfieldOffset: (meta >> 16) & 0xff,
 			BitfieldLength: (meta >> 24) & 0xff,
 			PidStride:      meta >> 32,
-			BigEndian:      (meta & (1 << 8)) != 0,
 		}
 	case execArgResult:
+		meta := dec.read()
 		arg := ExecArgResult{
-			Size:    dec.read(),
+			Size:    meta & 0xff,
+			Format:  BinaryFormat((meta >> 8) & 0xff),
 			Index:   dec.read(),
 			DivOp:   dec.read(),
 			AddOp:   dec.read(),
@@ -158,8 +162,12 @@ func (dec *execDecoder) readArg() ExecArg {
 		dec.vars[arg.Index] = arg.Default
 		return arg
 	case execArgData:
+		flags := dec.read()
+		size := flags & ^execArgDataReadable
+		readable := flags&execArgDataReadable != 0
 		return ExecArgData{
-			Data: dec.readBlob(dec.read()),
+			Data:     dec.readBlob(size),
+			Readable: readable,
 		}
 	case execArgCsum:
 		size := dec.read()

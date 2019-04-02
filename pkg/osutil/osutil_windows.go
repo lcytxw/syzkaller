@@ -15,7 +15,8 @@ import (
 func HandleInterrupts(shutdown chan struct{}) {
 }
 
-func UmountAll(dir string) {
+func RemoveAll(dir string) error {
+	return os.RemoveAll(dir)
 }
 
 func prolongPipe(r, w *os.File) {
@@ -33,10 +34,6 @@ func ProcessExitStatus(ps *os.ProcessState) int {
 	return ps.Sys().(syscall.WaitStatus).ExitStatus()
 }
 
-func ProcessSignal(p *os.Process, sig int) bool {
-	return false
-}
-
 func Sandbox(cmd *exec.Cmd, user, net bool) error {
 	return nil
 }
@@ -46,4 +43,7 @@ func SandboxChown(file string) error {
 }
 
 func setPdeathsig(cmd *exec.Cmd) {
+}
+
+func killPgroup(cmd *exec.Cmd) {
 }

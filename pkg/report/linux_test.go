@@ -5,38 +5,33 @@ package report
 
 import (
 	"fmt"
-	"regexp"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/symbolizer"
 )
 
 func TestLinuxIgnores(t *testing.T) {
-	reporter, err := NewReporter("linux", "", "", nil, nil)
+	cfg := &mgrconfig.Config{
+		TargetOS:   "linux",
+		TargetArch: "amd64",
+	}
+	reporter, err := NewReporter(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignores1 := []*regexp.Regexp{
-		regexp.MustCompile("BUG: bug3"),
-	}
-	reporter1, err := NewReporter("linux", "", "", nil, ignores1)
+	cfg.Ignores = []string{"BUG: bug3"}
+	reporter1, err := NewReporter(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignores2 := []*regexp.Regexp{
-		regexp.MustCompile("BUG: bug3"),
-		regexp.MustCompile("BUG: bug1"),
-	}
-	reporter2, err := NewReporter("linux", "", "", nil, ignores2)
+	cfg.Ignores = []string{"BUG: bug3", "BUG: bug1"}
+	reporter2, err := NewReporter(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignores3 := []*regexp.Regexp{
-		regexp.MustCompile("BUG: bug3"),
-		regexp.MustCompile("BUG: bug1"),
-		regexp.MustCompile("BUG: bug2"),
-	}
-	reporter3, err := NewReporter("linux", "", "", nil, ignores3)
+	cfg.Ignores = []string{"BUG: bug3", "BUG: bug1", "BUG: bug2"}
+	reporter3, err := NewReporter(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +81,7 @@ func TestLinuxSymbolizeLine(t *testing.T) {
 		},
 		{
 			"RIP: 0010:[<ffffffff8188c0e6>]  [<ffffffff8188c0e6>]  foo+0x101/0x185\n",
-			"RIP: 0010:[<ffffffff8188c0e6>]  [<ffffffff8188c0e6>]  foo+0x101/0x185 foo.c:555\n",
+			"RIP: 0010:[<ffffffff8188c0e6>]  [<ffffffff8188c0e6>]  foo+0x101/0x185 foo.c:550\n",
 		},
 		// Strip "./" file prefix.
 		{
@@ -142,13 +137,13 @@ func TestLinuxSymbolizeLine(t *testing.T) {
 		},
 	}
 	symbols := map[string][]symbolizer.Symbol{
-		"foo": []symbolizer.Symbol{
+		"foo": {
 			{Addr: 0x1000000, Size: 0x190},
 		},
-		"do_ipv6_setsockopt.isra.7.part.3": []symbolizer.Symbol{
+		"do_ipv6_setsockopt.isra.7.part.3": {
 			{Addr: 0x2000000, Size: 0x2830},
 		},
-		"baz": []symbolizer.Symbol{
+		"baz": {
 			{Addr: 0x3000000, Size: 0x100},
 			{Addr: 0x4000000, Size: 0x200},
 			{Addr: 0x5000000, Size: 0x300},
@@ -164,6 +159,13 @@ func TestLinuxSymbolizeLine(t *testing.T) {
 				{
 					File: "/linux/foo.c",
 					Line: 555,
+				},
+			}, nil
+		case 0x1000101:
+			return []symbolizer.Frame{
+				{
+					File: "/linux/foo.c",
+					Line: 550,
 				},
 			}, nil
 		case 0x1000110:

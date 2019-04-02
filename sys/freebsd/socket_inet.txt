@@ -11,11 +11,6 @@ include <netinet/in.h>
 resource sock_in[sock]
 resource ifindex[int32]
 
-sock_in_pair {
-	f0	sock_in
-	f1	sock_in
-}
-
 sockaddr_in {
 	family	const[AF_INET, int16]
 	port	sock_port
@@ -29,7 +24,6 @@ sockaddr_storage_in {
 }
 
 socket$inet(domain const[AF_INET], type flags[socket_type], proto int8) sock_in
-socketpair$inet(domain const[AF_INET], type flags[socket_type], proto int8, fds ptr[out, sock_in_pair])
 accept$inet(fd sock_in, peer ptr[out, sockaddr_in, opt], peerlen ptr[inout, len[peer, int32]]) sock_in
 accept4$inet(fd sock_in, peer ptr[out, sockaddr_in, opt], peerlen ptr[inout, len[peer, int32]], flags flags[accept_flags]) sock_in
 bind$inet(fd sock_in, addr ptr[in, sockaddr_in], addrlen len[addr])
@@ -105,12 +99,6 @@ ip_msfilter {
 
 ip_msfilter_mode = MCAST_INCLUDE, MCAST_EXCLUDE
 
-in_pktinfo {
-	ipi_ifindex	ifindex
-	ipi_spec_dst	ipv4_addr
-	ipi_addr	ipv4_addr
-}
-
 group_req_in {
 	gr_interface	int32
 	gr_group	sockaddr_storage_in
@@ -120,12 +108,4 @@ group_source_req_in {
 	gsr_interface	int32
 	gsr_group	sockaddr_storage_in
 	gsr_source	sockaddr_storage_in
-}
-
-group_filter_in {
-	gf_interface	int32
-	gf_group	sockaddr_storage_in
-	gf_fmode	flags[ip_msfilter_mode, int32]
-	gf_numsrc	len[gf_slist, int32]
-	gf_slist	array[sockaddr_storage_in]
 }

@@ -7,6 +7,7 @@ package dash
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,8 +15,13 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 )
 
+func init() {
+	initMocks()
+	installConfig(testConfig)
+}
+
 // Config used in tests.
-var config = GlobalConfig{
+var testConfig = &GlobalConfig{
 	AccessLevel: AccessPublic,
 	AuthDomain:  "@syzkaller.com",
 	Clients: map[string]string{
@@ -25,25 +31,34 @@ var config = GlobalConfig{
 		"\"Bar\" <BlackListed@Domain.com>",
 	},
 	Namespaces: map[string]*Config{
-		"test1": &Config{
+		"test1": {
 			AccessLevel: AccessAdmin,
 			Key:         "test1keytest1keytest1key",
 			Clients: map[string]string{
 				client1: key1,
 			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org",
+					Branch: "branch10",
+					Alias:  "repo10alias",
+					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+				},
+				{
+					URL:    "git://github.com/google/syzkaller",
+					Branch: "master",
+					Alias:  "repo10alias",
+					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+				},
+			},
 			Reporting: []Reporting{
 				{
 					Name:       "reporting1",
 					DailyLimit: 3,
+					Embargo:    14 * 24 * time.Hour,
+					Filter:     skipWithRepro,
 					Config: &TestConfig{
 						Index: 1,
-					},
-					Filter: func(bug *Bug) FilterResult {
-						if strings.HasPrefix(bug.Title, "skip without repro") &&
-							bug.ReproLevel != dashapi.ReproLevelNone {
-							return FilterSkip
-						}
-						return FilterReport
 					},
 				},
 				{
@@ -55,38 +70,70 @@ var config = GlobalConfig{
 				},
 			},
 		},
-		"test2": &Config{
+		"test2": {
 			AccessLevel: AccessAdmin,
 			Key:         "test2keytest2keytest2key",
 			Clients: map[string]string{
 				client2: key2,
 			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org",
+					Branch: "branch10",
+					Alias:  "repo10alias",
+					CC:     []string{"maintainers@repo10.org", "bugs@repo10.org"},
+				},
+			},
+			Managers: map[string]ConfigManager{
+				"restricted-manager": {
+					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
+					RestrictedTestingReason: "you should test only on restricted.git",
+				},
+			},
 			Reporting: []Reporting{
 				{
 					Name:       "reporting1",
 					DailyLimit: 5,
+					Embargo:    14 * 24 * time.Hour,
+					Filter:     skipWithRepro,
 					Config: &EmailConfig{
-						Email:      "test@syzkaller.com",
-						Moderation: true,
+						Email: "test@syzkaller.com",
 					},
 				},
 				{
 					Name:       "reporting2",
 					DailyLimit: 3,
+					Filter:     skipWithRepro2,
 					Config: &EmailConfig{
 						Email:              "bugs@syzkaller.com",
 						DefaultMaintainers: []string{"default@maintainers.com"},
 						MailMaintainers:    true,
 					},
 				},
+				{
+					Name:       "reporting3",
+					DailyLimit: 3,
+					Config: &EmailConfig{
+						Email:              "bugs2@syzkaller.com",
+						DefaultMaintainers: []string{"default2@maintainers.com"},
+						MailMaintainers:    true,
+					},
+				},
 			},
 		},
 		// Namespaces for access level testing.
-		"access-admin": &Config{
+		"access-admin": {
 			AccessLevel: AccessAdmin,
 			Key:         "adminkeyadminkeyadminkey",
 			Clients: map[string]string{
 				clientAdmin: keyAdmin,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-admin.git",
+					Branch: "access-admin",
+					Alias:  "access-admin",
+				},
 			},
 			Reporting: []Reporting{
 				{
@@ -99,11 +146,18 @@ var config = GlobalConfig{
 				},
 			},
 		},
-		"access-user": &Config{
+		"access-user": {
 			AccessLevel: AccessUser,
 			Key:         "userkeyuserkeyuserkey",
 			Clients: map[string]string{
 				clientUser: keyUser,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-user.git",
+					Branch: "access-user",
+					Alias:  "access-user",
+				},
 			},
 			Reporting: []Reporting{
 				{
@@ -117,10 +171,18 @@ var config = GlobalConfig{
 				},
 			},
 		},
-		"access-public": &Config{
-			Key: "publickeypublickeypublickey",
+		"access-public": {
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
 			Clients: map[string]string{
 				clientPublic: keyPublic,
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-public.git",
+					Branch: "access-public",
+					Alias:  "access-public",
+				},
 			},
 			Reporting: []Reporting{
 				{
@@ -150,16 +212,28 @@ const (
 	keyPublic    = "clientpublickeyclientpublickey"
 )
 
+func skipWithRepro(bug *Bug) FilterResult {
+	if strings.HasPrefix(bug.Title, "skip with repro") &&
+		bug.ReproLevel != dashapi.ReproLevelNone {
+		return FilterSkip
+	}
+	return FilterReport
+}
+
+func skipWithRepro2(bug *Bug) FilterResult {
+	if strings.HasPrefix(bug.Title, "skip reporting2 with repro") &&
+		bug.ReproLevel != dashapi.ReproLevelNone {
+		return FilterSkip
+	}
+	return FilterReport
+}
+
 type TestConfig struct {
 	Index int
 }
 
 func (cfg *TestConfig) Type() string {
 	return "test"
-}
-
-func (cfg *TestConfig) NeedMaintainers() bool {
-	return false
 }
 
 func (cfg *TestConfig) Validate() error {
@@ -170,11 +244,14 @@ func testBuild(id int) *dashapi.Build {
 	return &dashapi.Build{
 		Manager:           fmt.Sprintf("manager%v", id),
 		ID:                fmt.Sprintf("build%v", id),
+		OS:                "linux",
+		Arch:              "amd64",
+		VMArch:            "amd64",
 		SyzkallerCommit:   fmt.Sprintf("syzkaller_commit%v", id),
 		CompilerID:        fmt.Sprintf("compiler%v", id),
 		KernelRepo:        fmt.Sprintf("repo%v", id),
 		KernelBranch:      fmt.Sprintf("branch%v", id),
-		KernelCommit:      fmt.Sprintf("kernel_commit%v", id),
+		KernelCommit:      strings.Repeat(fmt.Sprint(id), 40)[:40],
 		KernelCommitTitle: fmt.Sprintf("kernel_commit_title%v", id),
 		KernelCommitDate:  buildCommitDate,
 		KernelConfig:      []byte(fmt.Sprintf("config%v", id)),
@@ -213,319 +290,234 @@ func TestApp(t *testing.T) {
 
 	c.expectOK(c.GET("/"))
 
-	c.expectFail("unknown api method", c.API(client1, key1, "unsupported_method", nil, nil))
-
-	ent := &dashapi.LogEntry{
-		Name: "name",
-		Text: "text",
-	}
-	c.expectOK(c.API(client1, key1, "log_error", ent, nil))
+	apiClient1 := c.makeClient(client1, key1, false)
+	apiClient2 := c.makeClient(client2, key2, false)
+	c.expectFail("unknown api method", apiClient1.Query("unsupported_method", nil, nil))
+	c.client.LogError("name", "msg %s", "arg")
 
 	build := testBuild(1)
-	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
+	c.client.UploadBuild(build)
 	// Uploading the same build must be OK.
-	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
+	c.client.UploadBuild(build)
 
 	// Some bad combinations of client/key.
-	c.expectFail("unauthorized request", c.API(client1, "", "upload_build", build, nil))
-	c.expectFail("unauthorized request", c.API("unknown", key1, "upload_build", build, nil))
-	c.expectFail("unauthorized request", c.API(client1, key2, "upload_build", build, nil))
+	c.expectFail("unauthorized", c.makeClient(client1, "", false).Query("upload_build", build, nil))
+	c.expectFail("unauthorized", c.makeClient("unknown", key1, false).Query("upload_build", build, nil))
+	c.expectFail("unauthorized", c.makeClient(client1, key2, false).Query("upload_build", build, nil))
 
-	crash1 := &dashapi.Crash{
-		BuildID:     "build1",
-		Title:       "title1",
-		Maintainers: []string{`"Foo Bar" <foo@bar.com>`, `bar@foo.com`},
-		Log:         []byte("log1"),
-		Report:      []byte("report1"),
-	}
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
+	crash1 := testCrash(build, 1)
+	c.client.ReportCrash(crash1)
 
 	// Test that namespace isolation works.
-	c.expectFail("unknown build", c.API(client2, key2, "report_crash", crash1, nil))
+	c.expectFail("unknown build", apiClient2.Query("report_crash", crash1, nil))
 
-	crash2 := &dashapi.Crash{
-		BuildID:     "build1",
-		Title:       "title2",
-		Maintainers: []string{`bar@foo.com`},
-		Log:         []byte("log2"),
-		Report:      []byte("report2"),
-		ReproOpts:   []byte("opts"),
-		ReproSyz:    []byte("syz repro"),
-		ReproC:      []byte("c repro"),
-	}
-	c.expectOK(c.API(client1, key1, "report_crash", crash2, nil))
+	crash2 := testCrashWithRepro(build, 2)
+	c.client.ReportCrash(crash2)
 
 	// Provoke purgeOldCrashes.
 	for i := 0; i < 30; i++ {
-		crash := &dashapi.Crash{
-			BuildID:     "build1",
-			Title:       "title1",
-			Maintainers: []string{`bar@foo.com`},
-			Log:         []byte(fmt.Sprintf("log%v", i)),
-			Report:      []byte(fmt.Sprintf("report%v", i)),
-		}
-		c.expectOK(c.API(client1, key1, "report_crash", crash, nil))
+		crash := testCrash(build, 3)
+		crash.Log = []byte(fmt.Sprintf("log%v", i))
+		crash.Report = []byte(fmt.Sprintf("report%v", i))
+		c.client.ReportCrash(crash)
 	}
 
 	cid := &dashapi.CrashID{
 		BuildID: "build1",
 		Title:   "title1",
 	}
-	c.expectOK(c.API(client1, key1, "report_failed_repro", cid, nil))
+	c.client.ReportFailedRepro(cid)
 
-	pr := &dashapi.PollBugsRequest{
-		Type: "test",
-	}
-	resp := new(dashapi.PollBugsResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, resp))
+	c.client.ReportingPollBugs("test")
 
-	cmd := &dashapi.BugUpdate{
+	c.client.ReportingUpdate(&dashapi.BugUpdate{
 		ID:         "id",
 		Status:     dashapi.BugStatusOpen,
 		ReproLevel: dashapi.ReproLevelC,
-		DupOf:      "",
+	})
+}
+
+// Test purging of old crashes for bugs with lots of crashes.
+func TestPurgeOldCrashes(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
 	}
-	c.expectOK(c.API(client1, key1, "reporting_update", cmd, nil))
-}
-
-// Normal workflow:
-//  - upload crash -> need repro
-//  - upload syz repro -> still need repro
-//  - upload C repro -> don't need repro
-func testNeedRepro1(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	crash1 := crashCtor(c)
-	resp := new(dashapi.ReportCrashResp)
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, true)
-
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, true)
-
-	// Still need repro for this crash.
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, true)
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, true)
-
-	crash2 := new(dashapi.Crash)
-	*crash2 = *crash1
-	crash2.ReproOpts = []byte("opts")
-	crash2.ReproSyz = []byte("repro syz")
-	c.expectOK(c.API(client1, key1, "report_crash", crash2, resp))
-	c.expectEQ(resp.NeedRepro, true)
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, true)
-
-	crash2.ReproC = []byte("repro C")
-	c.expectOK(c.API(client1, key1, "report_crash", crash2, resp))
-	c.expectEQ(resp.NeedRepro, false)
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-}
-
-func TestNeedRepro1_normal(t *testing.T)      { testNeedRepro1(t, normalCrash) }
-func TestNeedRepro1_dup(t *testing.T)         { testNeedRepro1(t, dupCrash) }
-func TestNeedRepro1_closed(t *testing.T)      { testNeedRepro1(t, closedCrash) }
-func TestNeedRepro1_closedRepro(t *testing.T) { testNeedRepro1(t, closedWithReproCrash) }
-
-// Upload C repro with first crash -> don't need repro.
-func testNeedRepro2(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
-	c := NewCtx(t)
-	defer c.Close()
-
-	crash1 := crashCtor(c)
-	crash1.ReproOpts = []byte("opts")
-	crash1.ReproSyz = []byte("repro syz")
-	crash1.ReproC = []byte("repro C")
-	resp := new(dashapi.ReportCrashResp)
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-}
-
-func TestNeedRepro2_normal(t *testing.T)      { testNeedRepro2(t, normalCrash) }
-func TestNeedRepro2_dup(t *testing.T)         { testNeedRepro2(t, dupCrash) }
-func TestNeedRepro2_closed(t *testing.T)      { testNeedRepro2(t, closedCrash) }
-func TestNeedRepro2_closedRepro(t *testing.T) { testNeedRepro2(t, closedWithReproCrash) }
-
-// Test that after uploading 5 failed repros, app stops requesting repros.
-func testNeedRepro3(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
-	c := NewCtx(t)
-	defer c.Close()
-
-	crash1 := crashCtor(c)
-	resp := new(dashapi.ReportCrashResp)
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-
-	for i := 0; i < maxReproPerBug; i++ {
-		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-		c.expectEQ(resp.NeedRepro, true)
-
-		c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-		c.expectEQ(needReproResp.NeedRepro, true)
-
-		c.expectOK(c.API(client1, key1, "report_failed_repro", cid, nil))
-	}
-
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-}
-
-func TestNeedRepro3_normal(t *testing.T)      { testNeedRepro3(t, normalCrash) }
-func TestNeedRepro3_dup(t *testing.T)         { testNeedRepro3(t, dupCrash) }
-func TestNeedRepro3_closed(t *testing.T)      { testNeedRepro3(t, closedCrash) }
-func TestNeedRepro3_closedRepro(t *testing.T) { testNeedRepro3(t, closedWithReproCrash) }
-
-// Test that after uploading 5 syz repros, app stops requesting repros.
-func testNeedRepro4(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
-	c := NewCtx(t)
-	defer c.Close()
-
-	crash1 := crashCtor(c)
-	crash1.ReproOpts = []byte("opts")
-	crash1.ReproSyz = []byte("repro syz")
-	resp := new(dashapi.ReportCrashResp)
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-
-	for i := 0; i < maxReproPerBug-1; i++ {
-		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-		c.expectEQ(resp.NeedRepro, true)
-
-		c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-		c.expectEQ(needReproResp.NeedRepro, true)
-	}
-
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-}
-
-func TestNeedRepro4_normal(t *testing.T)      { testNeedRepro4(t, normalCrash) }
-func TestNeedRepro4_dup(t *testing.T)         { testNeedRepro4(t, dupCrash) }
-func TestNeedRepro4_closed(t *testing.T)      { testNeedRepro4(t, closedCrash) }
-func TestNeedRepro4_closedRepro(t *testing.T) { testNeedRepro4(t, closedWithReproCrash) }
-
-func testNeedRepro5(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
-	c := NewCtx(t)
-	defer c.Close()
-
-	crash1 := crashCtor(c)
-	crash1.ReproOpts = []byte("opts")
-	crash1.ReproSyz = []byte("repro syz")
-	resp := new(dashapi.ReportCrashResp)
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-
-	for i := 0; i < maxReproPerBug-1; i++ {
-		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-		c.expectEQ(resp.NeedRepro, true)
-
-		c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-		c.expectEQ(needReproResp.NeedRepro, true)
-	}
-
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-}
-
-func TestNeedRepro5_normal(t *testing.T)      { testNeedRepro5(t, normalCrash) }
-func TestNeedRepro5_dup(t *testing.T)         { testNeedRepro5(t, dupCrash) }
-func TestNeedRepro5_closed(t *testing.T)      { testNeedRepro5(t, closedCrash) }
-func TestNeedRepro5_closedRepro(t *testing.T) { testNeedRepro5(t, closedWithReproCrash) }
-
-func normalCrash(c *Ctx) *dashapi.Crash {
 	build := testBuild(1)
-	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
-	return testCrash(build, 1)
-}
+	c.client.UploadBuild(build)
 
-func dupCrash(c *Ctx) *dashapi.Crash {
-	build := testBuild(1)
-	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
-
-	crash1 := testCrash(build, 1)
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
-
-	crash2 := testCrash(build, 2)
-	c.expectOK(c.API(client1, key1, "report_crash", crash2, nil))
-
-	pr := &dashapi.PollBugsRequest{
-		Type: "test",
-	}
-	resp := new(dashapi.PollBugsResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, resp))
-	c.expectEQ(len(resp.Reports), 2)
-	rep1 := resp.Reports[0]
-	rep2 := resp.Reports[1]
-	cmd := &dashapi.BugUpdate{
-		ID:     rep2.ID,
-		Status: dashapi.BugStatusDup,
-		DupOf:  rep1.ID,
-	}
-	reply := new(dashapi.BugUpdateReply)
-	c.expectOK(c.API(client1, key1, "reporting_update", cmd, reply))
-	c.expectEQ(reply.OK, true)
-
-	return crash2
-}
-
-func closedCrash(c *Ctx) *dashapi.Crash {
-	return closedCrashImpl(c, false)
-}
-
-func closedWithReproCrash(c *Ctx) *dashapi.Crash {
-	return closedCrashImpl(c, true)
-}
-
-func closedCrashImpl(c *Ctx, withRepro bool) *dashapi.Crash {
-	build := testBuild(1)
-	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
-
+	// First, send 3 crashes that are reported. These need to be preserved regardless.
 	crash := testCrash(build, 1)
-	if withRepro {
-		crash.ReproC = []byte("repro C")
-	}
-	resp := new(dashapi.ReportCrashResp)
-	c.expectOK(c.API(client1, key1, "report_crash", crash, resp))
-	c.expectEQ(resp.NeedRepro, !withRepro)
+	crash.ReproOpts = []byte("no repro")
+	c.client.ReportCrash(crash)
+	rep := c.client.pollBug()
 
-	pr := &dashapi.PollBugsRequest{
-		Type: "test",
-	}
-	pollResp := new(dashapi.PollBugsResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, pollResp))
-	c.expectEQ(len(pollResp.Reports), 1)
-	rep := pollResp.Reports[0]
-	cmd := &dashapi.BugUpdate{
-		ID:     rep.ID,
-		Status: dashapi.BugStatusInvalid,
-	}
-	reply := new(dashapi.BugUpdateReply)
-	c.expectOK(c.API(client1, key1, "reporting_update", cmd, reply))
-	c.expectEQ(reply.OK, true)
+	crash.ReproSyz = []byte("getpid()")
+	crash.ReproOpts = []byte("syz repro")
+	c.client.ReportCrash(crash)
+	c.client.pollBug()
 
-	crash.ReproC = nil
-	return crash
+	crash.ReproC = []byte("int main() {}")
+	crash.ReproOpts = []byte("C repro")
+	c.client.ReportCrash(crash)
+	c.client.pollBug()
+
+	// Now report lots of bugs with/without repros. Some of the older ones should be purged.
+	const totalReported = 3 * maxCrashes
+	for i := 0; i < totalReported; i++ {
+		c.advanceTime(2 * time.Hour) // This ensures that crashes are saved.
+		crash.ReproSyz = nil
+		crash.ReproC = nil
+		crash.ReproOpts = []byte(fmt.Sprintf("%v", i))
+		c.client.ReportCrash(crash)
+
+		crash.ReproSyz = []byte("syz repro")
+		crash.ReproC = []byte("C repro")
+		crash.ReproOpts = []byte(fmt.Sprintf("%v", i))
+		c.client.ReportCrash(crash)
+	}
+	bug, _, _ := c.loadBug(rep.ID)
+	crashes, _, err := queryCrashesForBug(c.ctx, bug.key(c.ctx), 10*totalReported)
+	c.expectOK(err)
+	// First, count how many crashes of different types we have.
+	// We should get all 3 reported crashes + some with repros and some without repros.
+	reported, norepro, repro := 0, 0, 0
+	for _, crash := range crashes {
+		if !crash.Reported.IsZero() {
+			reported++
+		} else if crash.ReproSyz == 0 {
+			norepro++
+		} else {
+			repro++
+		}
+	}
+	c.t.Logf("got reported=%v, norepro=%v, repro=%v, maxCrashes=%v",
+		reported, norepro, repro, maxCrashes)
+	if reported != 3 ||
+		norepro < maxCrashes || norepro > maxCrashes+10 ||
+		repro < maxCrashes || repro > maxCrashes+10 {
+		c.t.Fatalf("bad purged crashes")
+	}
+	// Then, check that latest crashes were preserved.
+	for _, crash := range crashes {
+		if !crash.Reported.IsZero() {
+			continue
+		}
+		idx, err := strconv.Atoi(string(crash.ReproOpts))
+		c.expectOK(err)
+		count := norepro
+		if crash.ReproSyz != 0 {
+			count = repro
+		}
+		if idx < totalReported-count {
+			c.t.Errorf("preserved bad crash repro=%v: %v", crash.ReproC != 0, idx)
+		}
+	}
+}
+
+func TestManagerFailedBuild(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	// Upload and check first build.
+	build := testBuild(1)
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, nil, nil)
+
+	// Upload and check second build.
+	build.ID = "id1"
+	build.KernelCommit = "kern1"
+	build.SyzkallerCommit = "syz1"
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, nil, nil)
+
+	// Upload failed kernel build.
+	failedBuild := new(dashapi.Build)
+	*failedBuild = *build
+	failedBuild.ID = "id2"
+	failedBuild.KernelCommit = "kern2"
+	failedBuild.KernelCommitTitle = "failed build 1"
+	failedBuild.SyzkallerCommit = "syz2"
+	c.expectOK(c.client.ReportBuildError(&dashapi.BuildErrorReq{
+		Build: *failedBuild,
+		Crash: dashapi.Crash{
+			Title: "failed build 1",
+		},
+	}))
+	checkManagerBuild(c, build, failedBuild, nil)
+
+	// Now the old good build again, nothing should change.
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, failedBuild, nil)
+
+	// New good kernel build, failed build must reset.
+	build.ID = "id3"
+	build.KernelCommit = "kern3"
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, nil, nil)
+
+	// Now more complex scenario: OK -> failed kernel -> failed kernel+syzkaller -> failed syzkaller -> OK.
+	failedBuild.ID = "id4"
+	failedBuild.KernelCommit = "kern4"
+	failedBuild.KernelCommitTitle = "failed build 4"
+	failedBuild.SyzkallerCommit = "syz4"
+	c.expectOK(c.client.ReportBuildError(&dashapi.BuildErrorReq{
+		Build: *failedBuild,
+		Crash: dashapi.Crash{
+			Title: "failed build 4",
+		},
+	}))
+	checkManagerBuild(c, build, failedBuild, nil)
+
+	failedBuild2 := new(dashapi.Build)
+	*failedBuild2 = *failedBuild
+	failedBuild2.ID = "id5"
+	failedBuild2.KernelCommit = ""
+	failedBuild2.KernelCommitTitle = "failed build 5"
+	failedBuild2.SyzkallerCommit = "syz5"
+	c.expectOK(c.client.ReportBuildError(&dashapi.BuildErrorReq{
+		Build: *failedBuild2,
+		Crash: dashapi.Crash{
+			Title: "failed build 5",
+		},
+	}))
+	checkManagerBuild(c, build, failedBuild, failedBuild2)
+
+	build.ID = "id6"
+	build.KernelCommit = "kern6"
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, nil, failedBuild2)
+
+	build.ID = "id7"
+	build.KernelCommit = "kern6"
+	build.SyzkallerCommit = "syz7"
+	c.client.UploadBuild(build)
+	checkManagerBuild(c, build, nil, nil)
+}
+
+func checkManagerBuild(c *Ctx, build, failedKernelBuild, failedSyzBuild *dashapi.Build) {
+	mgr, dbBuild := c.loadManager("test1", build.Manager)
+	c.expectEQ(mgr.CurrentBuild, build.ID)
+	compareBuilds(c, dbBuild, build)
+	checkBuildBug(c, mgr.FailedBuildBug, failedKernelBuild)
+	checkBuildBug(c, mgr.FailedSyzBuildBug, failedSyzBuild)
+}
+
+func checkBuildBug(c *Ctx, hash string, build *dashapi.Build) {
+	if build == nil {
+		c.expectEQ(hash, "")
+		return
+	}
+	c.expectNE(hash, "")
+	bug, _, dbBuild := c.loadBugByHash(hash)
+	c.expectEQ(bug.Title, build.KernelCommitTitle)
+	compareBuilds(c, dbBuild, build)
+}
+
+func compareBuilds(c *Ctx, dbBuild *Build, build *dashapi.Build) {
+	c.expectEQ(dbBuild.ID, build.ID)
+	c.expectEQ(dbBuild.KernelCommit, build.KernelCommit)
+	c.expectEQ(dbBuild.SyzkallerCommit, build.SyzkallerCommit)
 }

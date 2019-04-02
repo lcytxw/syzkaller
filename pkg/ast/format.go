@@ -35,6 +35,21 @@ func SerializeNode(n Node) string {
 	return buf.String()
 }
 
+func FormatInt(v uint64, format IntFmt) string {
+	switch format {
+	case IntFmtDec:
+		return fmt.Sprint(v)
+	case IntFmtNeg:
+		return fmt.Sprint(int64(v))
+	case IntFmtHex:
+		return fmt.Sprintf("0x%x", v)
+	case IntFmtChar:
+		return fmt.Sprintf("'%c'", v)
+	default:
+		panic(fmt.Sprintf("unknown int format %v", format))
+	}
+}
+
 type serializer interface {
 	serialize(w io.Writer)
 }
@@ -159,14 +174,14 @@ func fmtType(t *Type) string {
 	case t.HasString:
 		v = fmt.Sprintf("\"%v\"", t.String)
 	default:
-		v = fmtIntValue(t.Value, t.ValueHex)
+		v = FormatInt(t.Value, t.ValueFmt)
 	}
 	if t.HasColon {
 		switch {
 		case t.Ident2 != "":
 			v += fmt.Sprintf(":%v", t.Ident2)
 		default:
-			v += fmt.Sprintf(":%v", fmtIntValue(t.Value2, t.Value2Hex))
+			v += fmt.Sprintf(":%v", FormatInt(t.Value2, t.Value2Fmt))
 		}
 	}
 	v += fmtTypeList(t.Args)
@@ -206,15 +221,8 @@ func fmtInt(i *Int) string {
 	case i.CExpr != "":
 		return fmt.Sprintf("%v", i.CExpr)
 	default:
-		return fmtIntValue(i.Value, i.ValueHex)
+		return FormatInt(i.Value, i.ValueFmt)
 	}
-}
-
-func fmtIntValue(v uint64, hex bool) string {
-	if hex {
-		return fmt.Sprintf("0x%x", v)
-	}
-	return fmt.Sprint(v)
 }
 
 func comma(i int, or string) string {

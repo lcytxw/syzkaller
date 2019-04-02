@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestExtractCommand(t *testing.T) {
@@ -15,14 +17,14 @@ func TestExtractCommand(t *testing.T) {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			cmd, args := extractCommand([]byte(test.body))
 			if cmd != test.cmd || !reflect.DeepEqual(args, test.args) {
-				t.Logf("expect: %q %q", test.cmd, test.args)
-				t.Logf("got   : %q %q", cmd, args)
+				t.Logf("expect: %v %q", test.cmd, test.args)
+				t.Logf("got   : %v %q", cmd, args)
 				t.Fail()
 			}
 			cmd, args = extractCommand([]byte(strings.Replace(test.body, "\n", "\r\n", -1)))
 			if cmd != test.cmd || !reflect.DeepEqual(args, test.args) {
-				t.Logf("expect: %q %q", test.cmd, test.args)
-				t.Logf("got   : %q %q", cmd, args)
+				t.Logf("expect: %v %q", test.cmd, test.args)
+				t.Logf("got   : %v %q", cmd, args)
 				t.Fail()
 			}
 		})
@@ -122,10 +124,8 @@ func TestParse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(email, &test.res) {
-				t.Logf("expect:\n%#v", &test.res)
-				t.Logf("got:\n%#v", email)
-				t.Fail()
+			if diff := cmp.Diff(&test.res, email); diff != "" {
+				t.Error(diff)
 			}
 		}
 		t.Run(fmt.Sprint(i), func(t *testing.T) { body(t, test) })
@@ -138,7 +138,7 @@ func TestParse(t *testing.T) {
 
 var extractCommandTests = []struct {
 	body string
-	cmd  string
+	cmd  Command
 	args string
 }{
 	{
@@ -146,17 +146,17 @@ var extractCommandTests = []struct {
 
 line1
 #syz  fix:  bar baz 	`,
-		cmd:  "fix:",
+		cmd:  CmdFix,
 		args: "bar baz",
 	},
 	{
 		body: `Hello,
 
 line1
-#syz fix:  bar  	 baz
+#syz fix  bar  	 baz
 line 2
 `,
-		cmd: "fix:",
+		cmd: CmdFix,
 		args: "bar  	 baz",
 	},
 	{
@@ -165,7 +165,7 @@ line1
 > #syz fix: bar   baz
 line 2
 `,
-		cmd:  "",
+		cmd:  CmdNone,
 		args: "",
 	},
 	// This is unfortunate case when a command is split by email client
@@ -175,15 +175,15 @@ line 2
 #syz test: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
 locking/core
 `,
-		cmd:  "test:",
+		cmd:  CmdTest,
 		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
 	},
 	{
 		body: `
-#syz test:
+#syz test
 git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core
 `,
-		cmd:  "test:",
+		cmd:  CmdTest,
 		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
 	},
 	{
@@ -193,7 +193,7 @@ git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
 locking/core
 locking/core
 `,
-		cmd:  "test:",
+		cmd:  CmdTest,
 		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
 	},
 	{
@@ -205,14 +205,14 @@ locking/core
 arg4
 arg5
 `,
-		cmd:  "test_5_arg_cmd",
+		cmd:  cmdTest5,
 		args: "arg1 arg2 arg3 arg4 arg5",
 	},
 	{
 		body: `
 #syz test_5_arg_cmd arg1
 arg2`,
-		cmd:  "test_5_arg_cmd",
+		cmd:  cmdTest5,
 		args: "arg1 arg2",
 	},
 	{
@@ -220,7 +220,7 @@ arg2`,
 #syz test_5_arg_cmd arg1
 arg2
 `,
-		cmd:  "test_5_arg_cmd",
+		cmd:  cmdTest5,
 		args: "arg1 arg2",
 	},
 	{
@@ -230,7 +230,7 @@ arg2
 
  
 `,
-		cmd:  "test_5_arg_cmd",
+		cmd:  cmdTest5,
 		args: "arg1 arg2",
 	},
 	{
@@ -240,7 +240,7 @@ arg1 arg2 arg3
 arg4 arg5
  
 `,
-		cmd:  "fix:",
+		cmd:  CmdFix,
 		args: "arg1 arg2 arg3",
 	},
 	{
@@ -248,8 +248,33 @@ arg4 arg5
 #syz  fix: arg1 arg2 arg3
 arg4 arg5 
 `,
-		cmd:  "fix:",
+		cmd:  CmdFix,
 		args: "arg1 arg2 arg3",
+	},
+	{
+		body: `
+#syz dup: title goes here
+baz
+`,
+		cmd:  CmdDup,
+		args: "title goes here",
+	},
+	{
+		body: `
+#syz dup 
+title on the next line goes here  
+but not this one
+`,
+		cmd:  CmdDup,
+		args: "title on the next line goes here",
+	},
+	{
+		body: `
+#syz foo bar
+baz
+`,
+		cmd:  CmdUnknown,
+		args: "foo bar",
 	},
 }
 
@@ -258,6 +283,7 @@ type ParseTest struct {
 	res   Email
 }
 
+// nolint: lll
 var parseTests = []ParseTest{
 	{`Date: Sun, 7 May 2017 19:54:00 -0700
 Message-ID: <123>
@@ -294,7 +320,7 @@ To post to this group, send email to syzkaller@googlegroups.com.
 To view this discussion on the web visit https://groups.google.com/d/msgid/syzkaller/abcdef@google.com.
 For more options, visit https://groups.google.com/d/optout.`,
 			Patch:       "",
-			Command:     "fix:",
+			Command:     CmdFix,
 			CommandArgs: "arg1 arg2 arg3",
 		}},
 
@@ -315,7 +341,8 @@ last line`,
 			Cc:        []string{"bob@example.com"},
 			Body: `text body
 last line`,
-			Patch: "",
+			Patch:   "",
+			Command: CmdNone,
 		}},
 
 	{`Date: Sun, 7 May 2017 19:54:00 -0700
@@ -338,7 +365,7 @@ text body
 second line
 last line`,
 			Patch:       "",
-			Command:     "invalid",
+			Command:     CmdInvalid,
 			CommandArgs: "",
 		}},
 
@@ -363,8 +390,8 @@ second line
 last line
 #syz command`,
 			Patch:       "",
-			Command:     "command",
-			CommandArgs: "",
+			Command:     CmdUnknown,
+			CommandArgs: "command",
 		}},
 
 	{`Date: Sun, 7 May 2017 19:54:00 -0700
@@ -412,7 +439,7 @@ IHQpKSB7CiAJCXNwaW5fdW5sb2NrKCZrY292LT5sb2NrKTsKIAkJcmV0dXJuOwo=
  		spin_unlock(&kcov->lock);
  		return;
 `,
-			Command:     "",
+			Command:     CmdNone,
 			CommandArgs: "",
 		}},
 
@@ -522,7 +549,87 @@ index 3d85747bd86e..a257b872a53d 100644
   error = vfs_statx(dfd, filename, flags, &stat, mask);
   if (error)
 `,
-			Command:     "test",
-			CommandArgs: "",
+			Command:     CmdTest,
+			CommandArgs: "commit 59372bbf3abd5b24a7f6f676a3968685c280f955",
 		}},
+
+	{`Sender: syzkaller-bugs@googlegroups.com
+Subject: Re: BUG: unable to handle kernel NULL pointer dereference in
+ sock_poll
+To: syzbot <syzbot+344bb0f46d7719cd9483@syzkaller.appspotmail.com>
+From: bar <bar@foo.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 10 Jun 2018 10:38:20 +0900
+MIME-Version: 1.0
+Content-Type: text/plain; charset="UTF-8"
+Content-Language: en-US
+Content-Transfer-Encoding: quoted-printable
+
+On 2018/06/10 4:57, syzbot wrote:
+> Hello,
+>=20
+> syzbot found the following crash on:
+>=20
+> HEAD commit: 7d3bf613e99a Merge tag 'libnvdimm-for-4.18=
+' of git://git.k..
+> git tree: upstream
+> console output: https://syzkaller.appspot.com/x/log.txt?x=3D1188a05f80000=
+0
+> kernel config: https://syzkaller.appspot.com/x/.config?x=3Df04d8d0a=
+2afb789a
+
+#syz dup: BUG: unable to handle kernel NULL pointer dereference in corrupte=
+d
+`, Email{
+		MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+		Subject:   "Re: BUG: unable to handle kernel NULL pointer dereference in sock_poll",
+		From:      "\"bar\" <bar@foo.com>",
+		Cc:        []string{"bar@foo.com", "syzbot@syzkaller.appspotmail.com"},
+		Body: `On 2018/06/10 4:57, syzbot wrote:
+> Hello,
+> 
+> syzbot found the following crash on:
+> 
+> HEAD commit: 7d3bf613e99a Merge tag 'libnvdimm-for-4.18' of git://git.k..
+> git tree: upstream
+> console output: https://syzkaller.appspot.com/x/log.txt?x=1188a05f800000
+> kernel config: https://syzkaller.appspot.com/x/.config?x=f04d8d0a2afb789a
+
+#syz dup: BUG: unable to handle kernel NULL pointer dereference in corrupted
+`,
+		Command:     CmdDup,
+		CommandArgs: "BUG: unable to handle kernel NULL pointer dereference in corrupted",
+	}},
+
+	{`Sender: syzkaller-bugs@googlegroups.com
+To: syzbot <syzbot+6dd701dc797b23b8c761@syzkaller.appspotmail.com>
+From: bar@foo.com
+
+#syz dup:
+BUG: unable to handle kernel NULL pointer dereference in corrupted
+`, Email{
+		From: "<bar@foo.com>",
+		Cc:   []string{"bar@foo.com", "syzbot@syzkaller.appspotmail.com"},
+		Body: `#syz dup:
+BUG: unable to handle kernel NULL pointer dereference in corrupted
+`,
+		Command:     CmdDup,
+		CommandArgs: "BUG: unable to handle kernel NULL pointer dereference in corrupted",
+	}},
+
+	{`Sender: syzkaller-bugs@googlegroups.com
+To: syzbot <syzbot+6dd701dc797b23b8c761@syzkaller.appspotmail.com>
+From: bar@foo.com
+
+#syz fix:
+When freeing a lockf struct that already is part of a linked list, make sure to
+`, Email{
+		From: "<bar@foo.com>",
+		Cc:   []string{"bar@foo.com", "syzbot@syzkaller.appspotmail.com"},
+		Body: `#syz fix:
+When freeing a lockf struct that already is part of a linked list, make sure to
+`,
+		Command:     CmdFix,
+		CommandArgs: "When freeing a lockf struct that already is part of a linked list, make sure to",
+	}},
 }

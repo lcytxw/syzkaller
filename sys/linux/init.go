@@ -4,42 +4,49 @@
 package linux
 
 import (
+	"bytes"
 	"runtime"
 
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
-func initTarget(target *prog.Target) {
+func InitTarget(target *prog.Target) {
 	arch := &arch{
-		mmapSyscall:               target.SyscallMap["mmap"],
-		clockGettimeSyscall:       target.SyscallMap["clock_gettime"],
-		PROT_READ:                 target.ConstMap["PROT_READ"],
-		PROT_WRITE:                target.ConstMap["PROT_WRITE"],
-		MAP_ANONYMOUS:             target.ConstMap["MAP_ANONYMOUS"],
-		MAP_PRIVATE:               target.ConstMap["MAP_PRIVATE"],
-		MAP_FIXED:                 target.ConstMap["MAP_FIXED"],
-		MREMAP_MAYMOVE:            target.ConstMap["MREMAP_MAYMOVE"],
-		MREMAP_FIXED:              target.ConstMap["MREMAP_FIXED"],
-		S_IFREG:                   target.ConstMap["S_IFREG"],
-		S_IFCHR:                   target.ConstMap["S_IFCHR"],
-		S_IFBLK:                   target.ConstMap["S_IFBLK"],
-		S_IFIFO:                   target.ConstMap["S_IFIFO"],
-		S_IFSOCK:                  target.ConstMap["S_IFSOCK"],
-		SYSLOG_ACTION_CONSOLE_OFF: target.ConstMap["SYSLOG_ACTION_CONSOLE_OFF"],
-		SYSLOG_ACTION_CONSOLE_ON:  target.ConstMap["SYSLOG_ACTION_CONSOLE_ON"],
-		SYSLOG_ACTION_SIZE_UNREAD: target.ConstMap["SYSLOG_ACTION_SIZE_UNREAD"],
-		FIFREEZE:                  target.ConstMap["FIFREEZE"],
-		FITHAW:                    target.ConstMap["FITHAW"],
-		PTRACE_TRACEME:            target.ConstMap["PTRACE_TRACEME"],
-		CLOCK_REALTIME:            target.ConstMap["CLOCK_REALTIME"],
-		ARCH_SET_FS:               target.ConstMap["ARCH_SET_FS"],
-		ARCH_SET_GS:               target.ConstMap["ARCH_SET_GS"],
-		AF_NFC:                    target.ConstMap["AF_NFC"],
-		AF_LLC:                    target.ConstMap["AF_LLC"],
-		AF_BLUETOOTH:              target.ConstMap["AF_BLUETOOTH"],
+		unix:                        targets.MakeUnixSanitizer(target),
+		clockGettimeSyscall:         target.SyscallMap["clock_gettime"],
+		MREMAP_MAYMOVE:              target.GetConst("MREMAP_MAYMOVE"),
+		MREMAP_FIXED:                target.GetConst("MREMAP_FIXED"),
+		SYSLOG_ACTION_CONSOLE_OFF:   target.GetConst("SYSLOG_ACTION_CONSOLE_OFF"),
+		SYSLOG_ACTION_CONSOLE_ON:    target.GetConst("SYSLOG_ACTION_CONSOLE_ON"),
+		SYSLOG_ACTION_CONSOLE_LEVEL: target.GetConst("SYSLOG_ACTION_CONSOLE_LEVEL"),
+		SYSLOG_ACTION_CLEAR:         target.GetConst("SYSLOG_ACTION_CLEAR"),
+		SYSLOG_ACTION_SIZE_UNREAD:   target.GetConst("SYSLOG_ACTION_SIZE_UNREAD"),
+		FIFREEZE:                    target.GetConst("FIFREEZE"),
+		FITHAW:                      target.GetConst("FITHAW"),
+		SNAPSHOT_FREEZE:             target.GetConst("SNAPSHOT_FREEZE"),
+		SNAPSHOT_UNFREEZE:           target.GetConst("SNAPSHOT_UNFREEZE"),
+		EXT4_IOC_SHUTDOWN:           target.GetConst("EXT4_IOC_SHUTDOWN"),
+		EXT4_IOC_RESIZE_FS:          target.GetConst("EXT4_IOC_RESIZE_FS"),
+		EXT4_IOC_MIGRATE:            target.GetConst("EXT4_IOC_MIGRATE"),
+		FAN_OPEN_PERM:               target.GetConst("FAN_OPEN_PERM"),
+		FAN_ACCESS_PERM:             target.GetConst("FAN_ACCESS_PERM"),
+		FAN_OPEN_EXEC_PERM:          target.GetConst("FAN_OPEN_EXEC_PERM"),
+		PTRACE_TRACEME:              target.GetConst("PTRACE_TRACEME"),
+		CLOCK_REALTIME:              target.GetConst("CLOCK_REALTIME"),
+		AF_NFC:                      target.GetConst("AF_NFC"),
+		AF_LLC:                      target.GetConst("AF_LLC"),
+		AF_BLUETOOTH:                target.GetConst("AF_BLUETOOTH"),
+		AF_X25:                      target.GetConst("AF_X25"),
+		AF_AX25:                     target.GetConst("AF_AX25"),
+		AF_NETROM:                   target.GetConst("AF_NETROM"),
+		AF_ROSE:                     target.GetConst("AF_ROSE"),
+		// These are not present on all arches.
+		ARCH_SET_FS: target.ConstMap["ARCH_SET_FS"],
+		ARCH_SET_GS: target.ConstMap["ARCH_SET_GS"],
 	}
 
-	target.MakeMmap = arch.makeMmap
+	target.MakeMmap = targets.MakePosixMmap(target)
 	target.SanitizeCall = arch.sanitizeCall
 	target.SpecialTypes = map[string]func(g *prog.Gen, typ prog.Type, old prog.Arg) (
 		prog.Arg, []*prog.Call){
@@ -55,143 +62,116 @@ func initTarget(target *prog.Target) {
 		"arpt_replace":       arch.generateArptables,
 		"ebt_replace":        arch.generateEbtables,
 	}
-	target.StringDictionary = stringDictionary
-
-	if target.Arch == runtime.GOARCH {
-		KCOV_INIT_TRACE = uintptr(target.ConstMap["KCOV_INIT_TRACE"])
-		KCOV_ENABLE = uintptr(target.ConstMap["KCOV_ENABLE"])
-		KCOV_TRACE_CMP = uintptr(target.ConstMap["KCOV_TRACE_CMP"])
-	}
-}
-
-const (
-	invalidFD = ^uint64(0)
-)
-
-var (
-	// This should not be here, but for now we expose this for syz-fuzzer.
-	KCOV_INIT_TRACE uintptr
-	KCOV_ENABLE     uintptr
-	KCOV_TRACE_CMP  uintptr
-
 	// TODO(dvyukov): get rid of this, this must be in descriptions.
-	stringDictionary = []string{"user", "keyring", "trusted", "system", "security", "selinux",
+	target.StringDictionary = []string{
+		"user", "keyring", "trusted", "system", "security", "selinux",
 		"posix_acl_access", "mime_type", "md5sum", "nodev", "self",
 		"bdev", "proc", "cgroup", "cpuset",
 		"lo", "eth0", "eth1", "em0", "em1", "wlan0", "wlan1", "ppp0", "ppp1",
-		"vboxnet0", "vboxnet1", "vmnet0", "vmnet1", "GPL"}
-)
+		"vboxnet0", "vboxnet1", "vmnet0", "vmnet1", "GPL",
+	}
+	switch target.Arch {
+	case "amd64":
+		target.SpecialPointers = []uint64{
+			0xffffffff81000000, // kernel text
+		}
+	case "386":
+	case "arm64":
+	case "arm":
+	case "ppc64le":
+	default:
+		panic("unknown arch")
+	}
 
-type arch struct {
-	mmapSyscall         *prog.Syscall
-	clockGettimeSyscall *prog.Syscall
-
-	PROT_READ                 uint64
-	PROT_WRITE                uint64
-	MAP_ANONYMOUS             uint64
-	MAP_PRIVATE               uint64
-	MAP_FIXED                 uint64
-	MREMAP_MAYMOVE            uint64
-	MREMAP_FIXED              uint64
-	S_IFREG                   uint64
-	S_IFCHR                   uint64
-	S_IFBLK                   uint64
-	S_IFIFO                   uint64
-	S_IFSOCK                  uint64
-	SYSLOG_ACTION_CONSOLE_OFF uint64
-	SYSLOG_ACTION_CONSOLE_ON  uint64
-	SYSLOG_ACTION_SIZE_UNREAD uint64
-	FIFREEZE                  uint64
-	FITHAW                    uint64
-	PTRACE_TRACEME            uint64
-	CLOCK_REALTIME            uint64
-	ARCH_SET_FS               uint64
-	ARCH_SET_GS               uint64
-	AF_NFC                    uint64
-	AF_LLC                    uint64
-	AF_BLUETOOTH              uint64
-}
-
-// createMmapCall creates a "normal" mmap call that maps [addr, addr+size) memory range.
-func (arch *arch) makeMmap(addr, size uint64) *prog.Call {
-	meta := arch.mmapSyscall
-	return &prog.Call{
-		Meta: meta,
-		Args: []prog.Arg{
-			prog.MakeVmaPointerArg(meta.Args[0], addr, size),
-			prog.MakeConstArg(meta.Args[1], size),
-			prog.MakeConstArg(meta.Args[2], arch.PROT_READ|arch.PROT_WRITE),
-			prog.MakeConstArg(meta.Args[3], arch.MAP_ANONYMOUS|arch.MAP_PRIVATE|arch.MAP_FIXED),
-			prog.MakeResultArg(meta.Args[4], nil, invalidFD),
-			prog.MakeConstArg(meta.Args[5], 0),
-		},
-		Ret: prog.MakeReturnArg(meta.Ret),
+	if target.Arch == runtime.GOARCH {
+		KCOV_INIT_TRACE = uintptr(target.GetConst("KCOV_INIT_TRACE"))
+		KCOV_ENABLE = uintptr(target.GetConst("KCOV_ENABLE"))
+		KCOV_REMOTE_ENABLE = uintptr(target.GetConst("KCOV_REMOTE_ENABLE"))
+		KCOV_DISABLE = uintptr(target.GetConst("KCOV_DISABLE"))
+		KCOV_TRACE_PC = uintptr(target.GetConst("KCOV_TRACE_PC"))
+		KCOV_TRACE_CMP = uintptr(target.GetConst("KCOV_TRACE_CMP"))
 	}
 }
 
+var (
+	// This should not be here, but for now we expose this for syz-fuzzer.
+	KCOV_INIT_TRACE    uintptr
+	KCOV_ENABLE        uintptr
+	KCOV_REMOTE_ENABLE uintptr
+	KCOV_DISABLE       uintptr
+	KCOV_TRACE_PC      uintptr
+	KCOV_TRACE_CMP     uintptr
+)
+
+type arch struct {
+	unix *targets.UnixSanitizer
+
+	clockGettimeSyscall *prog.Syscall
+
+	MREMAP_MAYMOVE              uint64
+	MREMAP_FIXED                uint64
+	SYSLOG_ACTION_CONSOLE_OFF   uint64
+	SYSLOG_ACTION_CONSOLE_ON    uint64
+	SYSLOG_ACTION_CONSOLE_LEVEL uint64
+	SYSLOG_ACTION_CLEAR         uint64
+	SYSLOG_ACTION_SIZE_UNREAD   uint64
+	FIFREEZE                    uint64
+	FITHAW                      uint64
+	SNAPSHOT_FREEZE             uint64
+	SNAPSHOT_UNFREEZE           uint64
+	EXT4_IOC_SHUTDOWN           uint64
+	EXT4_IOC_RESIZE_FS          uint64
+	EXT4_IOC_MIGRATE            uint64
+	FAN_OPEN_PERM               uint64
+	FAN_ACCESS_PERM             uint64
+	FAN_OPEN_EXEC_PERM          uint64
+	PTRACE_TRACEME              uint64
+	CLOCK_REALTIME              uint64
+	ARCH_SET_FS                 uint64
+	ARCH_SET_GS                 uint64
+	AF_NFC                      uint64
+	AF_LLC                      uint64
+	AF_BLUETOOTH                uint64
+	AF_X25                      uint64
+	AF_AX25                     uint64
+	AF_NETROM                   uint64
+	AF_ROSE                     uint64
+}
+
 func (arch *arch) sanitizeCall(c *prog.Call) {
+	arch.unix.SanitizeCall(c)
 	switch c.Meta.CallName {
-	case "mmap":
-		// Add MAP_FIXED flag, otherwise it produces non-deterministic results.
-		c.Args[3].(*prog.ConstArg).Val |= arch.MAP_FIXED
 	case "mremap":
 		// Add MREMAP_FIXED flag, otherwise it produces non-deterministic results.
 		flags := c.Args[3].(*prog.ConstArg)
 		if flags.Val&arch.MREMAP_MAYMOVE != 0 {
 			flags.Val |= arch.MREMAP_FIXED
 		}
-	case "mknod", "mknodat":
-		pos := 1
-		if c.Meta.CallName == "mknodat" {
-			pos = 2
-		}
-		if _, ok := c.Args[pos+1].Type().(*prog.ProcType); ok {
-			return
-		}
-		mode := c.Args[pos].(*prog.ConstArg)
-		dev := c.Args[pos+1].(*prog.ConstArg)
-		dev.Val = uint64(uint32(dev.Val))
-		// Char and block devices read/write io ports, kernel memory and do other nasty things.
-		// TODO: not required if executor drops privileges.
-		switch mode.Val & (arch.S_IFREG | arch.S_IFCHR | arch.S_IFBLK | arch.S_IFIFO | arch.S_IFSOCK) {
-		case arch.S_IFREG, arch.S_IFIFO, arch.S_IFSOCK:
-		case arch.S_IFBLK:
-			if dev.Val>>8 == 7 {
-				break // loop
-			}
-			mode.Val &^= arch.S_IFBLK
-			mode.Val |= arch.S_IFREG
-		case arch.S_IFCHR:
-			mode.Val &^= arch.S_IFCHR
-			mode.Val |= arch.S_IFREG
-		}
 	case "syslog":
 		cmd := c.Args[0].(*prog.ConstArg)
 		cmd.Val = uint64(uint32(cmd.Val))
 		// These disable console output, but we need it.
-		if cmd.Val == arch.SYSLOG_ACTION_CONSOLE_OFF || cmd.Val == arch.SYSLOG_ACTION_CONSOLE_ON {
+		if cmd.Val == arch.SYSLOG_ACTION_CONSOLE_OFF ||
+			cmd.Val == arch.SYSLOG_ACTION_CONSOLE_ON ||
+			cmd.Val == arch.SYSLOG_ACTION_CONSOLE_LEVEL ||
+			cmd.Val == arch.SYSLOG_ACTION_CLEAR {
 			cmd.Val = arch.SYSLOG_ACTION_SIZE_UNREAD
 		}
 	case "ioctl":
-		cmd := c.Args[1].(*prog.ConstArg)
-		// Freeze kills machine. Though, it is an interesting functions,
-		// so we need to test it somehow.
-		// TODO: not required if executor drops privileges.
-		if uint64(uint32(cmd.Val)) == arch.FIFREEZE {
-			cmd.Val = arch.FITHAW
-		}
+		arch.sanitizeIoctl(c)
+	case "fanotify_mark":
+		// FAN_*_PERM require the program to reply to open requests.
+		// If that does not happen, the program will hang in an unkillable state forever.
+		// See the following bug for details:
+		// https://groups.google.com/d/msg/syzkaller-bugs/pD-vbqJu6U0/kGH30p3lBgAJ
+		mask := c.Args[2].(*prog.ConstArg)
+		mask.Val &^= arch.FAN_OPEN_PERM | arch.FAN_ACCESS_PERM | arch.FAN_OPEN_EXEC_PERM
 	case "ptrace":
 		req := c.Args[0].(*prog.ConstArg)
 		// PTRACE_TRACEME leads to unkillable processes, see:
 		// https://groups.google.com/forum/#!topic/syzkaller/uGzwvhlCXAw
-		if req.Val == arch.PTRACE_TRACEME {
+		if uint64(uint32(req.Val)) == arch.PTRACE_TRACEME {
 			req.Val = ^uint64(0)
-		}
-	case "exit", "exit_group":
-		code := c.Args[0].(*prog.ConstArg)
-		// These codes are reserved by executor.
-		if code.Val%128 == 67 || code.Val%128 == 68 {
-			code.Val = 1
 		}
 	case "arch_prctl":
 		// fs holds address of tls, if a program messes it at least signal
@@ -201,19 +181,76 @@ func (arch *arch) sanitizeCall(c *prog.Call) {
 		if uint64(uint32(cmd.Val)) == arch.ARCH_SET_FS {
 			cmd.Val = arch.ARCH_SET_GS
 		}
+	case "init_module":
+		// Kernel tries to vmalloc whatever we pass as size and it's not accounted against memcg.
+		// As the result it can lead to massive OOM kills of everything running on the machine.
+		// Strictly saying, the same applies to finit_module with a sparse file too,
+		// but there is no simple way to handle that.
+		sz := c.Args[1].(*prog.ConstArg)
+		sz.Val %= 1 << 20
 	case "syz_init_net_socket":
 		// Don't let it mess with arbitrary sockets in init namespace.
 		family := c.Args[0].(*prog.ConstArg)
 		switch uint64(uint32(family.Val)) {
-		case arch.AF_NFC, arch.AF_LLC, arch.AF_BLUETOOTH:
+		case arch.AF_NFC, arch.AF_LLC, arch.AF_BLUETOOTH,
+			arch.AF_X25, arch.AF_AX25, arch.AF_NETROM, arch.AF_ROSE:
 		default:
 			family.Val = ^uint64(0)
 		}
+	case "syz_open_procfs":
+		arch.sanitizeSyzOpenProcfs(c)
 	}
 
 	switch c.Meta.Name {
 	case "setsockopt$EBT_SO_SET_ENTRIES":
 		arch.sanitizeEbtables(c)
+	}
+}
+
+func (arch *arch) sanitizeIoctl(c *prog.Call) {
+	cmd := c.Args[1].(*prog.ConstArg)
+	// Freeze kills machine. Though, it is an interesting functions,
+	// so we need to test it somehow.
+	// TODO: not required if executor drops privileges.
+	// Fortunately, the value does not conflict with any other ioctl commands for now.
+	if uint64(uint32(cmd.Val)) == arch.FIFREEZE {
+		cmd.Val = arch.FITHAW
+	}
+	// SNAPSHOT_FREEZE freezes all processes and leaves the machine dead.
+	if uint64(uint32(cmd.Val)) == arch.SNAPSHOT_FREEZE {
+		cmd.Val = arch.SNAPSHOT_UNFREEZE
+	}
+	// EXT4_IOC_SHUTDOWN on root fs effectively brings the machine down in weird ways.
+	// Fortunately, the value does not conflict with any other ioctl commands for now.
+	if uint64(uint32(cmd.Val)) == arch.EXT4_IOC_SHUTDOWN {
+		cmd.Val = arch.EXT4_IOC_MIGRATE
+	}
+	// EXT4_IOC_RESIZE_FS on root fs can shrink it to 0 (or whatever is the minimum size)
+	// and then creation of new temp dirs for tests will fail.
+	// TODO: not necessary for sandbox=namespace as it tests in a tmpfs
+	// and/or if we mount tmpfs for sandbox=none (#971).
+	if uint64(uint32(cmd.Val)) == arch.EXT4_IOC_RESIZE_FS {
+		cmd.Val = arch.EXT4_IOC_MIGRATE
+	}
+}
+
+func (arch *arch) sanitizeSyzOpenProcfs(c *prog.Call) {
+	// If fuzzer manages to open /proc/self/exe, it does some nasty things with it:
+	//  - mark as non-executable
+	//  - set some extended acl's that prevent execution
+	//  - mark as immutable, etc
+	// As the result we fail to start executor again and recreate the VM.
+	// Don't let it open /proc/self/exe.
+	ptr := c.Args[1].(*prog.PointerArg)
+	if ptr.Res != nil {
+		arg := ptr.Res.(*prog.DataArg)
+		file := arg.Data()
+		for len(file) != 0 && (file[0] == '/' || file[0] == '.') {
+			file = file[1:]
+		}
+		if bytes.HasPrefix(file, []byte("exe")) {
+			arg.SetData([]byte("net\x00"))
+		}
 	}
 }
 
@@ -273,8 +310,8 @@ func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, old prog.Arg) (a
 			Ret: prog.MakeReturnArg(meta.Ret),
 		}
 		calls = append(calls, gettime)
-		sec := prog.MakeResultArg(typ.Fields[0], tp.Inner[0], 0)
-		nsec := prog.MakeResultArg(typ.Fields[1], tp.Inner[1], 0)
+		sec := prog.MakeResultArg(typ.Fields[0], tp.Inner[0].(*prog.ResultArg), 0)
+		nsec := prog.MakeResultArg(typ.Fields[1], tp.Inner[1].(*prog.ResultArg), 0)
 		msec := uint64(10)
 		if g.NOutOf(1, 2) {
 			msec = 30

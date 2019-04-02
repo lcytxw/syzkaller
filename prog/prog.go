@@ -8,37 +8,24 @@ import (
 )
 
 type Prog struct {
-	Target *Target
-	Calls  []*Call
+	Target   *Target
+	Calls    []*Call
+	Comments []string
 }
 
 type Call struct {
-	Meta *Syscall
-	Args []Arg
-	Ret  Arg
+	Meta    *Syscall
+	Args    []Arg
+	Ret     *ResultArg
+	Comment string
 }
 
 type Arg interface {
 	Type() Type
 	Size() uint64
-}
 
-// ArgUser is interface of an argument that uses value of another output argument.
-type ArgUser interface {
-	Uses() *Arg
-}
-
-// ArgUsed is interface of an argument that can be used by other arguments.
-type ArgUsed interface {
-	Used() *map[Arg]bool
-}
-
-func isUsed(arg Arg) bool {
-	used, ok := arg.(ArgUsed)
-	if !ok {
-		return false
-	}
-	return len(*used.Used()) != 0
+	validate(ctx *validCtx) error
+	serialize(ctx *serializer)
 }
 
 type ArgCommon struct {
@@ -64,48 +51,29 @@ func (arg *ConstArg) Size() uint64 {
 }
 
 // Value returns value, pid stride and endianness.
-func (arg *ConstArg) Value() (uint64, uint64, bool) {
+func (arg *ConstArg) Value() (uint64, uint64) {
 	switch typ := (*arg).Type().(type) {
 	case *IntType:
-		return arg.Val, 0, typ.BigEndian
+		return arg.Val, 0
 	case *ConstType:
-		return arg.Val, 0, typ.BigEndian
+		return arg.Val, 0
 	case *FlagsType:
-		return arg.Val, 0, typ.BigEndian
+		return arg.Val, 0
 	case *LenType:
-		return arg.Val, 0, typ.BigEndian
+		return arg.Val, 0
+	case *ResourceType:
+		return arg.Val, 0
 	case *CsumType:
 		// Checksums are computed dynamically in executor.
-		return 0, 0, false
-	case *ResourceType:
-		t := typ.Desc.Type.(*IntType)
-		return arg.Val, 0, t.BigEndian
+		return 0, 0
 	case *ProcType:
-		if arg.Val == typ.Default() {
-			return 0, 0, false
+		if arg.Val == procDefaultValue {
+			return 0, 0
 		}
-		return typ.ValuesStart + arg.Val, typ.ValuesPerProc, typ.BigEndian
+		return typ.ValuesStart + arg.Val, typ.ValuesPerProc
 	default:
 		panic(fmt.Sprintf("unknown ConstArg type %#v", typ))
 	}
-}
-
-func (arg *ConstArg) ValueForProc(pid uint64) uint64 {
-	v, stride, be := arg.Value()
-	v += stride * pid
-	if be {
-		switch arg.Size() {
-		case 2:
-			v = uint64(swap16(uint16(v)))
-		case 4:
-			v = uint64(swap32(uint32(v)))
-		case 8:
-			v = swap64(v)
-		default:
-			panic(fmt.Sprintf("bad const size %v", arg.Size()))
-		}
-	}
-	return v
 }
 
 // Used for PtrType and VmaType.
@@ -138,9 +106,13 @@ func MakeVmaPointerArg(t Type, addr, size uint64) *PointerArg {
 	}
 }
 
-func MakeNullPointerArg(t Type) *PointerArg {
+func MakeSpecialPointerArg(t Type, index uint64) *PointerArg {
+	if index >= maxSpecialPointers {
+		panic("bad special pointer index")
+	}
 	return &PointerArg{
 		ArgCommon: ArgCommon{typ: t},
+		Address:   -index,
 	}
 }
 
@@ -148,8 +120,15 @@ func (arg *PointerArg) Size() uint64 {
 	return arg.typ.Size()
 }
 
-func (arg *PointerArg) IsNull() bool {
-	return arg.Address == 0 && arg.VmaSize == 0 && arg.Res == nil
+func (arg *PointerArg) IsSpecial() bool {
+	return arg.VmaSize == 0 && arg.Res == nil && -arg.Address < maxSpecialPointers
+}
+
+func (target *Target) PhysicalAddr(arg *PointerArg) uint64 {
+	if arg.IsSpecial() {
+		return target.SpecialPointers[-arg.Address]
+	}
+	return target.DataOffset + arg.Address
 }
 
 // Used for BufferType.
@@ -185,6 +164,13 @@ func (arg *DataArg) Data() []byte {
 		panic("getting data of output data arg")
 	}
 	return arg.data
+}
+
+func (arg *DataArg) SetData(data []byte) {
+	if arg.Type().Dir() == DirOut {
+		panic("setting data of output data arg")
+	}
+	arg.data = append([]byte{}, data...)
 }
 
 // Used for StructType and ArrayType.
@@ -255,190 +241,57 @@ func (arg *UnionArg) Size() uint64 {
 }
 
 // Used for ResourceType.
-// Either holds constant value or reference another ResultArg or ReturnArg.
+// This is the only argument that can be used as syscall return value.
+// Either holds constant value or reference another ResultArg.
 type ResultArg struct {
 	ArgCommon
-	Res   Arg          // reference to arg which we use
-	OpDiv uint64       // divide result (executed before OpAdd)
-	OpAdd uint64       // add to result
-	Val   uint64       // value used if Res is nil
-	uses  map[Arg]bool // ArgResult args that use this arg
+	Res   *ResultArg          // reference to arg which we use
+	OpDiv uint64              // divide result (executed before OpAdd)
+	OpAdd uint64              // add to result
+	Val   uint64              // value used if Res is nil
+	uses  map[*ResultArg]bool // ArgResult args that use this arg
 }
 
-func MakeResultArg(t Type, r Arg, v uint64) *ResultArg {
+func MakeResultArg(t Type, r *ResultArg, v uint64) *ResultArg {
 	arg := &ResultArg{ArgCommon: ArgCommon{typ: t}, Res: r, Val: v}
 	if r == nil {
 		return arg
 	}
-	used := r.(ArgUsed)
-	if *used.Used() == nil {
-		*used.Used() = make(map[Arg]bool)
+	if r.uses == nil {
+		r.uses = make(map[*ResultArg]bool)
 	}
-	(*used.Used())[arg] = true
+	r.uses[arg] = true
 	return arg
+}
+
+func MakeReturnArg(t Type) *ResultArg {
+	if t == nil {
+		return nil
+	}
+	if t.Dir() != DirOut {
+		panic("return arg is not out")
+	}
+	return &ResultArg{ArgCommon: ArgCommon{typ: t}}
 }
 
 func (arg *ResultArg) Size() uint64 {
 	return arg.typ.Size()
 }
 
-func (arg *ResultArg) Used() *map[Arg]bool {
-	return &arg.uses
-}
-
-func (arg *ResultArg) Uses() *Arg {
-	return &arg.Res
-}
-
-// Used for ResourceType and VmaType.
-// This argument denotes syscall return value.
-type ReturnArg struct {
-	ArgCommon
-	uses map[Arg]bool // ArgResult args that use this arg
-}
-
-func MakeReturnArg(t Type) *ReturnArg {
-	return &ReturnArg{ArgCommon: ArgCommon{typ: t}}
-}
-
-func (arg *ReturnArg) Size() uint64 {
-	panic("not called")
-}
-
-func (arg *ReturnArg) Used() *map[Arg]bool {
-	return &arg.uses
-}
-
 // Returns inner arg for pointer args.
 func InnerArg(arg Arg) Arg {
-	if t, ok := arg.Type().(*PtrType); ok {
-		if a, ok := arg.(*PointerArg); ok {
-			if a.Res == nil {
-				if !t.Optional() {
-					panic(fmt.Sprintf("non-optional pointer is nil\narg: %+v\ntype: %+v", a, t))
-				}
-				return nil
-			}
-			return InnerArg(a.Res)
+	if _, ok := arg.Type().(*PtrType); ok {
+		res := arg.(*PointerArg).Res
+		if res == nil {
+			return nil
 		}
-		return nil // *ConstArg.
+		return InnerArg(res)
 	}
 	return arg // Not a pointer.
 }
 
-func (target *Target) defaultArg(t Type) Arg {
-	switch typ := t.(type) {
-	case *IntType, *ConstType, *FlagsType, *LenType, *ProcType, *CsumType:
-		return MakeConstArg(t, t.Default())
-	case *ResourceType:
-		return MakeResultArg(t, nil, typ.Default())
-	case *BufferType:
-		if t.Dir() == DirOut {
-			var sz uint64
-			if !typ.Varlen() {
-				sz = typ.Size()
-			}
-			return MakeOutDataArg(t, sz)
-		}
-		var data []byte
-		if !typ.Varlen() {
-			data = make([]byte, typ.Size())
-		}
-		return MakeDataArg(t, data)
-	case *ArrayType:
-		var elems []Arg
-		if typ.Kind == ArrayRangeLen && typ.RangeBegin == typ.RangeEnd {
-			for i := uint64(0); i < typ.RangeBegin; i++ {
-				elems = append(elems, target.defaultArg(typ.Type))
-			}
-		}
-		return MakeGroupArg(t, elems)
-	case *StructType:
-		var inner []Arg
-		for _, field := range typ.Fields {
-			inner = append(inner, target.defaultArg(field))
-		}
-		return MakeGroupArg(t, inner)
-	case *UnionType:
-		return MakeUnionArg(t, target.defaultArg(typ.Fields[0]))
-	case *VmaType:
-		if t.Optional() {
-			return MakeNullPointerArg(t)
-		}
-		return MakeVmaPointerArg(t, 0, target.PageSize)
-	case *PtrType:
-		if t.Optional() {
-			return MakeNullPointerArg(t)
-		}
-		return MakePointerArg(t, 0, target.defaultArg(typ.Type))
-	default:
-		panic(fmt.Sprintf("unknown arg type: %#v", t))
-	}
-}
-
-func (target *Target) isDefaultArg(arg Arg) bool {
-	if IsPad(arg.Type()) {
-		return true
-	}
-	switch a := arg.(type) {
-	case *ConstArg:
-		switch t := a.Type().(type) {
-		case *IntType, *ConstType, *FlagsType, *LenType, *ProcType, *CsumType:
-			return a.Val == t.Default()
-		default:
-			panic(fmt.Sprintf("unknown const type: %#v", t))
-		}
-	case *GroupArg:
-		if !a.fixedInnerSize() && len(a.Inner) != 0 {
-			return false
-		}
-		for _, elem := range a.Inner {
-			if !target.isDefaultArg(elem) {
-				return false
-			}
-		}
-		return true
-	case *UnionArg:
-		t := a.Type().(*UnionType)
-		return a.Option.Type().FieldName() == t.Fields[0].FieldName() &&
-			target.isDefaultArg(a.Option)
-	case *DataArg:
-		if a.Size() == 0 {
-			return true
-		}
-		if a.Type().Varlen() {
-			return false
-		}
-		if a.Type().Dir() == DirOut {
-			return true
-		}
-		for _, v := range a.Data() {
-			if v != 0 {
-				return false
-			}
-		}
-		return true
-	case *PointerArg:
-		switch t := a.Type().(type) {
-		case *PtrType:
-			if t.Optional() {
-				return a.IsNull()
-			}
-			return a.Address == 0 && target.isDefaultArg(a.Res)
-		case *VmaType:
-			if t.Optional() {
-				return a.IsNull()
-			}
-			return a.Address == 0 && a.VmaSize == target.PageSize
-		default:
-			panic(fmt.Sprintf("unknown pointer type: %#v", t))
-		}
-	case *ResultArg:
-		t := a.Type().(*ResourceType)
-		return a.Res == nil && a.OpDiv == 0 && a.OpAdd == 0 &&
-			len(a.uses) == 0 && a.Val == t.Default()
-	}
-	return false
+func isDefault(arg Arg) bool {
+	return arg.Type().isDefaultArg(arg)
 }
 
 func (p *Prog) insertBefore(c *Call, calls []*Call) {
@@ -489,37 +342,37 @@ func replaceArg(arg, arg1 Arg) {
 func replaceResultArg(arg, arg1 *ResultArg) {
 	// Remove link from `a.Res` to `arg`.
 	if arg.Res != nil {
-		delete(*arg.Res.(ArgUsed).Used(), arg)
+		delete(arg.Res.uses, arg)
 	}
 	// Copy all fields from `arg1` to `arg` except for the list of args that use `arg`.
-	used := *arg.Used()
+	uses := arg.uses
 	*arg = *arg1
-	*arg.Used() = used
+	arg.uses = uses
 	// Make the link in `arg.Res` (which is now `Res` of `arg1`) to point to `arg` instead of `arg1`.
 	if arg.Res != nil {
-		delete(*arg.Res.(ArgUsed).Used(), arg1)
-		(*arg.Res.(ArgUsed).Used())[arg] = true
+		resUses := arg.Res.uses
+		delete(resUses, arg1)
+		resUses[arg] = true
 	}
 }
 
 // removeArg removes all references to/from arg0 from a program.
 func removeArg(arg0 Arg) {
 	ForeachSubArg(arg0, func(arg Arg, ctx *ArgCtx) {
-		if a, ok := arg.(*ResultArg); ok && a.Res != nil {
-			if !(*a.Res.(ArgUsed).Used())[arg] {
+		a, ok := arg.(*ResultArg)
+		if !ok {
+			return
+		}
+		if a.Res != nil {
+			uses := a.Res.uses
+			if !uses[a] {
 				panic("broken tree")
 			}
-			delete(*a.Res.(ArgUsed).Used(), arg)
+			delete(uses, a)
 		}
-		if used, ok := arg.(ArgUsed); ok {
-			for arg1 := range *used.Used() {
-				a1, ok := arg1.(*ResultArg)
-				if !ok {
-					panic("use references not ArgResult")
-				}
-				arg2 := MakeResultArg(arg1.Type(), nil, arg1.Type().Default())
-				replaceResultArg(a1, arg2)
-			}
+		for arg1 := range a.uses {
+			arg2 := arg1.Type().DefaultArg().(*ResultArg)
+			replaceResultArg(arg1, arg2)
 		}
 	})
 }
@@ -530,7 +383,9 @@ func (p *Prog) removeCall(idx int) {
 	for _, arg := range c.Args {
 		removeArg(arg)
 	}
-	removeArg(c.Ret)
+	if c.Ret != nil {
+		removeArg(c.Ret)
+	}
 	copy(p.Calls[idx:], p.Calls[idx+1:])
 	p.Calls = p.Calls[:len(p.Calls)-1]
 }

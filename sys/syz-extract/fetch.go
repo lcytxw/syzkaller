@@ -6,7 +6,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -17,7 +16,8 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-func extract(info *compiler.ConstInfo, cc string, args []string, addSource string, declarePrintf bool) (map[string]uint64, map[string]bool, error) {
+func extract(info *compiler.ConstInfo, cc string, args []string, addSource string, declarePrintf bool) (
+	map[string]uint64, map[string]bool, error) {
 	data := &CompileData{
 		AddSource:     addSource,
 		Defines:       info.Defines,
@@ -36,10 +36,9 @@ func extract(info *compiler.ConstInfo, cc string, args []string, addSource strin
 			valMap[val] = true
 		}
 		for _, errMsg := range []string{
-			"error: ‘([a-zA-Z0-9_]+)’ undeclared",
-			"error: '([a-zA-Z0-9_]+)' undeclared",
-			"note: in expansion of macro ‘([a-zA-Z0-9_]+)’",
-			"error: use of undeclared identifier '([a-zA-Z0-9_]+)'",
+			`error: [‘']([a-zA-Z0-9_]+)[’'] undeclared`,
+			`note: in expansion of macro [‘']([a-zA-Z0-9_]+)[’']`,
+			`error: use of undeclared identifier [‘']([a-zA-Z0-9_]+)[’']`,
 		} {
 			re := regexp.MustCompile(errMsg)
 			matches := re.FindAllSubmatch(out, -1)
@@ -97,42 +96,31 @@ type CompileData struct {
 }
 
 func compile(cc string, args []string, data *CompileData) (bin string, out []byte, err error) {
-	srcFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to create temp file: %v", err)
-	}
-	srcFile.Close()
-	os.Remove(srcFile.Name())
-	srcName := srcFile.Name() + ".c"
-	defer os.Remove(srcName)
 	src := new(bytes.Buffer)
 	if err := srcTemplate.Execute(src, data); err != nil {
 		return "", nil, fmt.Errorf("failed to generate source: %v", err)
 	}
-	if err := ioutil.WriteFile(srcName, src.Bytes(), 0600); err != nil {
-		return "", nil, fmt.Errorf("failed to write source file: %v", err)
-	}
-
-	binFile, err := ioutil.TempFile("", "")
+	binFile, err := osutil.TempFile("syz-extract-bin")
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to create temp file: %v", err)
+		return "", nil, err
 	}
-	binFile.Close()
-
 	args = append(args, []string{
-		srcName,
-		"-o", binFile.Name(),
+		"-x", "c", "-",
+		"-o", binFile,
 		"-w",
 	}...)
-	out, err = osutil.Command(cc, args...).CombinedOutput()
-	if err != nil {
-		os.Remove(binFile.Name())
+	cmd := osutil.Command(cc, args...)
+	cmd.Stdin = src
+	if out, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(binFile)
 		return "", out, err
 	}
-	return binFile.Name(), nil, nil
+	return binFile, nil, nil
 }
 
 var srcTemplate = template.Must(template.New("").Parse(`
+#define __asm__(...)
+
 {{range $incl := $.Includes}}
 #include <{{$incl}}>
 {{end}}
@@ -152,7 +140,8 @@ int printf(const char *format, ...);
 int main() {
 	int i;
 	unsigned long long vals[] = {
-		{{range $val := $.Values}}(unsigned long long){{$val}},{{end}}
+		{{range $val := $.Values}}(unsigned long long){{$val}},
+		{{end}}
 	};
 	for (i = 0; i < sizeof(vals)/sizeof(vals[0]); i++) {
 		if (i != 0)

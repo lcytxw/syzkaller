@@ -1,11 +1,15 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+//go:generate go run gen.go
+
 package csource
 
 import (
 	"bytes"
 	"fmt"
+	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/osutil"
@@ -13,17 +17,21 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 )
 
-func createCommonHeader(p *prog.Prog, opts Options) ([]byte, error) {
-	commonHeader, err := getCommonHeader(p.Target.OS)
-	if err != nil {
-		return nil, err
-	}
-	defines, err := defineList(p, opts)
-	if err != nil {
-		return nil, err
-	}
+const (
+	linux   = "linux"
+	freebsd = "freebsd"
+	openbsd = "openbsd"
 
-	cmd := osutil.Command("cpp", "-nostdinc", "-undef", "-fdirectives-only", "-dDI", "-E", "-P", "-")
+	sandboxNone                = "none"
+	sandboxSetuid              = "setuid"
+	sandboxNamespace           = "namespace"
+	sandboxAndroidUntrustedApp = "android_untrusted_app"
+)
+
+func createCommonHeader(p, mmapProg *prog.Prog, replacements map[string]string, opts Options) ([]byte, error) {
+	defines := defineList(p, mmapProg, opts)
+	sysTarget := targets.Get(p.Target.OS, p.Target.Arch)
+	cmd := osutil.Command(sysTarget.CPP, "-nostdinc", "-undef", "-fdirectives-only", "-dDI", "-E", "-P", "-")
 	for _, def := range defines {
 		cmd.Args = append(cmd.Args, "-D"+def)
 	}
@@ -41,6 +49,10 @@ func createCommonHeader(p *prog.Prog, opts Options) ([]byte, error) {
 		return nil, err
 	}
 
+	for from, to := range replacements {
+		src = bytes.Replace(src, []byte("[["+from+"]]"), []byte(to), -1)
+	}
+
 	for from, to := range map[string]string{
 		"uint64": "uint64_t",
 		"uint32": "uint32_t",
@@ -53,73 +65,69 @@ func createCommonHeader(p *prog.Prog, opts Options) ([]byte, error) {
 	return src, nil
 }
 
-func defineList(p *prog.Prog, opts Options) ([]string, error) {
-	var defines []string
+func defineList(p, mmapProg *prog.Prog, opts Options) (defines []string) {
+	sysTarget := targets.Get(p.Target.OS, p.Target.Arch)
 	bitmasks, csums := prog.RequiredFeatures(p)
-	if bitmasks {
-		defines = append(defines, "SYZ_USE_BITMASKS")
+	enabled := map[string]bool{
+		"GOOS_" + p.Target.OS:               true,
+		"GOARCH_" + p.Target.Arch:           true,
+		"HOSTGOOS_" + runtime.GOOS:          true,
+		"SYZ_USE_BITMASKS":                  bitmasks,
+		"SYZ_USE_CHECKSUMS":                 csums,
+		"SYZ_SANDBOX_NONE":                  opts.Sandbox == sandboxNone,
+		"SYZ_SANDBOX_SETUID":                opts.Sandbox == sandboxSetuid,
+		"SYZ_SANDBOX_NAMESPACE":             opts.Sandbox == sandboxNamespace,
+		"SYZ_SANDBOX_ANDROID_UNTRUSTED_APP": opts.Sandbox == sandboxAndroidUntrustedApp,
+		"SYZ_THREADED":                      opts.Threaded,
+		"SYZ_COLLIDE":                       opts.Collide,
+		"SYZ_REPEAT":                        opts.Repeat,
+		"SYZ_REPEAT_TIMES":                  opts.RepeatTimes > 1,
+		"SYZ_PROCS":                         opts.Procs > 1,
+		"SYZ_FAULT_INJECTION":               opts.Fault,
+		"SYZ_TUN_ENABLE":                    opts.EnableTun,
+		"SYZ_ENABLE_CGROUPS":                opts.EnableCgroups,
+		"SYZ_ENABLE_NETDEV":                 opts.EnableNetDev,
+		"SYZ_RESET_NET_NAMESPACE":           opts.EnableNetReset,
+		"SYZ_ENABLE_BINFMT_MISC":            opts.EnableBinfmtMisc,
+		"SYZ_USE_TMP_DIR":                   opts.UseTmpDir,
+		"SYZ_HANDLE_SEGV":                   opts.HandleSegv,
+		"SYZ_REPRO":                         opts.Repro,
+		"SYZ_TRACE":                         opts.Trace,
+		"SYZ_EXECUTOR_USES_SHMEM":           sysTarget.ExecutorUsesShmem,
+		"SYZ_EXECUTOR_USES_FORK_SERVER":     sysTarget.ExecutorUsesForkServer,
 	}
-	if csums {
-		defines = append(defines, "SYZ_USE_CHECKSUMS")
-	}
-	switch opts.Sandbox {
-	case "":
-		// No sandbox, do nothing.
-	case "none":
-		defines = append(defines, "SYZ_SANDBOX_NONE")
-	case "setuid":
-		defines = append(defines, "SYZ_SANDBOX_SETUID")
-	case "namespace":
-		defines = append(defines, "SYZ_SANDBOX_NAMESPACE")
-	default:
-		return nil, fmt.Errorf("unknown sandbox mode: %v", opts.Sandbox)
-	}
-	if opts.Threaded {
-		defines = append(defines, "SYZ_THREADED")
-	}
-	if opts.Collide {
-		defines = append(defines, "SYZ_COLLIDE")
-	}
-	if opts.Repeat {
-		defines = append(defines, "SYZ_REPEAT")
-	}
-	if opts.Fault {
-		defines = append(defines, "SYZ_FAULT_INJECTION")
-	}
-	if opts.EnableTun {
-		defines = append(defines, "SYZ_TUN_ENABLE")
-	}
-	if opts.UseTmpDir {
-		defines = append(defines, "SYZ_USE_TMP_DIR")
-	}
-	if opts.HandleSegv {
-		defines = append(defines, "SYZ_HANDLE_SEGV")
-	}
-	if opts.WaitRepeat {
-		defines = append(defines, "SYZ_WAIT_REPEAT")
-		// TODO(dvyukov): this should have a separate option,
-		// but for now it's bundled with WaitRepeat.
-		defines = append(defines, "SYZ_RESET_NET_NAMESPACE")
-	}
-	if opts.Debug {
-		defines = append(defines, "SYZ_DEBUG")
+	for def, ok := range enabled {
+		if ok {
+			defines = append(defines, def)
+		}
 	}
 	for _, c := range p.Calls {
 		defines = append(defines, "__NR_"+c.Meta.CallName)
 	}
-	defines = append(defines, targets.List[p.Target.OS][p.Target.Arch].CArch...)
-	return defines, nil
+	for _, c := range mmapProg.Calls {
+		defines = append(defines, "__NR_"+c.Meta.CallName)
+	}
+	sort.Strings(defines)
+	return
 }
 
 func removeSystemDefines(src []byte, defines []string) ([]byte, error) {
-	remove := append(defines, []string{
-		"__STDC__",
-		"__STDC_HOSTED__",
-		"__STDC_UTF_16__",
-		"__STDC_UTF_32__",
-	}...)
-	for _, def := range remove {
-		src = bytes.Replace(src, []byte("#define "+def+" 1\n"), nil, -1)
+	remove := map[string]string{
+		"__STDC__":        "1",
+		"__STDC_HOSTED__": "1",
+		"__STDC_UTF_16__": "1",
+		"__STDC_UTF_32__": "1",
+	}
+	for _, def := range defines {
+		eq := strings.IndexByte(def, '=')
+		if eq == -1 {
+			remove[def] = "1"
+		} else {
+			remove[def[:eq]] = def[eq+1:]
+		}
+	}
+	for def, val := range remove {
+		src = bytes.Replace(src, []byte("#define "+def+" "+val+"\n"), nil, -1)
 	}
 	// strip: #define __STDC_VERSION__ 201112L
 	for _, def := range []string{"__STDC_VERSION__"} {

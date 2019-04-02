@@ -3,277 +3,327 @@
 
 // This file is shared between executor and csource package.
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#if SYZ_EXECUTOR
+const int kExtraCoverSize = 256 << 10;
+struct cover_t;
+static void cover_reset(cover_t* cov);
 #endif
 
-#include <endian.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#if defined(SYZ_EXECUTOR) || defined(SYZ_THREADED) || defined(SYZ_COLLIDE)
+#if SYZ_EXECUTOR || SYZ_THREADED
 #include <linux/futex.h>
 #include <pthread.h>
-#include <stdlib.h>
+
+typedef struct {
+	int state;
+} event_t;
+
+static void event_init(event_t* ev)
+{
+	ev->state = 0;
+}
+
+static void event_reset(event_t* ev)
+{
+	ev->state = 0;
+}
+
+static void event_set(event_t* ev)
+{
+	if (ev->state)
+		fail("event already set");
+	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
+	syscall(SYS_futex, &ev->state, FUTEX_WAKE | FUTEX_PRIVATE_FLAG);
+}
+
+static void event_wait(event_t* ev)
+{
+	while (!__atomic_load_n(&ev->state, __ATOMIC_ACQUIRE))
+		syscall(SYS_futex, &ev->state, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0);
+}
+
+static int event_isset(event_t* ev)
+{
+	return __atomic_load_n(&ev->state, __ATOMIC_ACQUIRE);
+}
+
+static int event_timedwait(event_t* ev, uint64 timeout)
+{
+	uint64 start = current_time_ms();
+	uint64 now = start;
+	for (;;) {
+		uint64 remain = timeout - (now - start);
+		struct timespec ts;
+		ts.tv_sec = remain / 1000;
+		ts.tv_nsec = (remain % 1000) * 1000 * 1000;
+		syscall(SYS_futex, &ev->state, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, &ts);
+		if (__atomic_load_n(&ev->state, __ATOMIC_RELAXED))
+			return 1;
+		now = current_time_ms();
+		if (now - start > timeout)
+			return 0;
+	}
+}
 #endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
+
+#if SYZ_EXECUTOR || SYZ_REPEAT || SYZ_TUN_ENABLE || SYZ_FAULT_INJECTION || SYZ_SANDBOX_NONE || \
+    SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
 #include <errno.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#include <time.h>
-#endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-#include <sys/prctl.h>
-#endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_USE_TMP_DIR))
-#include <dirent.h>
-#include <sys/mount.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_SANDBOX_NAMESPACE)
-#include <errno.h>
-#include <sched.h>
-#include <signal.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <sys/prctl.h>
-#include <sys/resource.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_SETUID)
-#include <grp.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NAMESPACE)
-#include <fcntl.h>
-#include <linux/capability.h>
-#include <sys/mman.h>
-#include <sys/mount.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+
+static bool write_file(const char* file, const char* what, ...)
+{
+	char buf[1024];
+	va_list args;
+	va_start(args, what);
+	vsnprintf(buf, sizeof(buf), what, args);
+	va_end(args);
+	buf[sizeof(buf) - 1] = 0;
+	int len = strlen(buf);
+
+	int fd = open(file, O_WRONLY | O_CLOEXEC);
+	if (fd == -1)
+		return false;
+	if (write(fd, buf, len) != len) {
+		int err = errno;
+		close(fd);
+		debug("write(%s) failed: %d\n", file, err);
+		errno = err;
+		return false;
+	}
+	close(fd);
+	return true;
+}
 #endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_TUN_ENABLE)
+
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV || SYZ_TUN_ENABLE
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+#include <linux/if_addr.h>
+#include <linux/if_link.h>
+#include <linux/in6.h>
+#include <linux/neighbour.h>
+#include <linux/net.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/veth.h>
+
+static struct {
+	char* pos;
+	int nesting;
+	struct nlattr* nested[8];
+	char buf[1024];
+} nlmsg;
+
+static void netlink_init(int typ, int flags, const void* data, int size)
+{
+	memset(&nlmsg, 0, sizeof(nlmsg));
+	struct nlmsghdr* hdr = (struct nlmsghdr*)nlmsg.buf;
+	hdr->nlmsg_type = typ;
+	hdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+	memcpy(hdr + 1, data, size);
+	nlmsg.pos = (char*)(hdr + 1) + NLMSG_ALIGN(size);
+}
+
+static void netlink_attr(int typ, const void* data, int size)
+{
+	struct nlattr* attr = (struct nlattr*)nlmsg.pos;
+	attr->nla_len = sizeof(*attr) + size;
+	attr->nla_type = typ;
+	memcpy(attr + 1, data, size);
+	nlmsg.pos += NLMSG_ALIGN(attr->nla_len);
+}
+
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+static void netlink_nest(int typ)
+{
+	struct nlattr* attr = (struct nlattr*)nlmsg.pos;
+	attr->nla_type = typ;
+	nlmsg.pos += sizeof(*attr);
+	nlmsg.nested[nlmsg.nesting++] = attr;
+}
+
+static void netlink_done(void)
+{
+	struct nlattr* attr = nlmsg.nested[--nlmsg.nesting];
+	attr->nla_len = nlmsg.pos - (char*)attr;
+}
+#endif
+
+static int netlink_send(int sock)
+{
+	if (nlmsg.pos > nlmsg.buf + sizeof(nlmsg.buf) || nlmsg.nesting)
+		fail("nlmsg overflow/bad nesting");
+	struct nlmsghdr* hdr = (struct nlmsghdr*)nlmsg.buf;
+	hdr->nlmsg_len = nlmsg.pos - nlmsg.buf;
+	struct sockaddr_nl addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.nl_family = AF_NETLINK;
+	unsigned n = sendto(sock, nlmsg.buf, hdr->nlmsg_len, 0, (struct sockaddr*)&addr, sizeof(addr));
+	if (n != hdr->nlmsg_len)
+		fail("short netlink write: %d/%d", n, hdr->nlmsg_len);
+	n = recv(sock, nlmsg.buf, sizeof(nlmsg.buf), 0);
+	if (n < sizeof(struct nlmsghdr) + sizeof(struct nlmsgerr))
+		fail("short netlink read: %d", n);
+	if (hdr->nlmsg_type != NLMSG_ERROR)
+		fail("short netlink ack: %d", hdr->nlmsg_type);
+	return -((struct nlmsgerr*)(hdr + 1))->error;
+}
+
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+static void netlink_add_device_impl(const char* type, const char* name)
+{
+	struct ifinfomsg hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	netlink_init(RTM_NEWLINK, NLM_F_EXCL | NLM_F_CREATE, &hdr, sizeof(hdr));
+	if (name)
+		netlink_attr(IFLA_IFNAME, name, strlen(name));
+	netlink_nest(IFLA_LINKINFO);
+	netlink_attr(IFLA_INFO_KIND, type, strlen(type));
+}
+
+static void netlink_add_device(int sock, const char* type, const char* name)
+{
+	netlink_add_device_impl(type, name);
+	netlink_done();
+	int err = netlink_send(sock);
+	debug("netlink: adding device %s type %s: %s\n", name, type, strerror(err));
+	(void)err;
+}
+
+static void netlink_add_veth(int sock, const char* name, const char* peer)
+{
+	netlink_add_device_impl("veth", name);
+	netlink_nest(IFLA_INFO_DATA);
+	netlink_nest(VETH_INFO_PEER);
+	nlmsg.pos += sizeof(struct ifinfomsg);
+	netlink_attr(IFLA_IFNAME, peer, strlen(peer));
+	netlink_done();
+	netlink_done();
+	netlink_done();
+	int err = netlink_send(sock);
+	debug("netlink: adding device %s type veth peer %s: %s\n", name, peer, strerror(err));
+	(void)err;
+}
+
+static void netlink_add_hsr(int sock, const char* name, const char* slave1, const char* slave2)
+{
+	netlink_add_device_impl("hsr", name);
+	netlink_nest(IFLA_INFO_DATA);
+	int ifindex1 = if_nametoindex(slave1);
+	netlink_attr(IFLA_HSR_SLAVE1, &ifindex1, sizeof(ifindex1));
+	int ifindex2 = if_nametoindex(slave2);
+	netlink_attr(IFLA_HSR_SLAVE2, &ifindex2, sizeof(ifindex2));
+	netlink_done();
+	netlink_done();
+	int err = netlink_send(sock);
+	debug("netlink: adding device %s type hsr slave1 %s slave2 %s: %s\n",
+	      name, slave1, slave2, strerror(err));
+	(void)err;
+}
+#endif
+
+static void netlink_device_change(int sock, const char* name, bool up,
+				  const char* master, const void* mac, int macsize)
+{
+	struct ifinfomsg hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	if (up)
+		hdr.ifi_flags = hdr.ifi_change = IFF_UP;
+	netlink_init(RTM_NEWLINK, 0, &hdr, sizeof(hdr));
+	netlink_attr(IFLA_IFNAME, name, strlen(name));
+	if (master) {
+		int ifindex = if_nametoindex(master);
+		netlink_attr(IFLA_MASTER, &ifindex, sizeof(ifindex));
+	}
+	if (macsize)
+		netlink_attr(IFLA_ADDRESS, mac, macsize);
+	int err = netlink_send(sock);
+	debug("netlink: device %s up master %s: %s\n", name, master, strerror(err));
+	(void)err;
+}
+
+static int netlink_add_addr(int sock, const char* dev, const void* addr, int addrsize)
+{
+	struct ifaddrmsg hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.ifa_family = addrsize == 4 ? AF_INET : AF_INET6;
+	hdr.ifa_prefixlen = addrsize == 4 ? 24 : 120;
+	hdr.ifa_scope = RT_SCOPE_UNIVERSE;
+	hdr.ifa_index = if_nametoindex(dev);
+	netlink_init(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &hdr, sizeof(hdr));
+	netlink_attr(IFA_LOCAL, addr, addrsize);
+	netlink_attr(IFA_ADDRESS, addr, addrsize);
+	return netlink_send(sock);
+}
+
+static void netlink_add_addr4(int sock, const char* dev, const char* addr)
+{
+	struct in_addr in_addr;
+	inet_pton(AF_INET, addr, &in_addr);
+	int err = netlink_add_addr(sock, dev, &in_addr, sizeof(in_addr));
+	debug("netlink: add addr %s dev %s: %s\n", addr, dev, strerror(err));
+	(void)err;
+}
+
+static void netlink_add_addr6(int sock, const char* dev, const char* addr)
+{
+	struct in6_addr in6_addr;
+	inet_pton(AF_INET6, addr, &in6_addr);
+	int err = netlink_add_addr(sock, dev, &in6_addr, sizeof(in6_addr));
+	debug("netlink: add addr %s dev %s: %s\n", addr, dev, strerror(err));
+	(void)err;
+}
+
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+static void netlink_add_neigh(int sock, const char* name,
+			      const void* addr, int addrsize, const void* mac, int macsize)
+{
+	struct ndmsg hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.ndm_family = addrsize == 4 ? AF_INET : AF_INET6;
+	hdr.ndm_ifindex = if_nametoindex(name);
+	hdr.ndm_state = NUD_PERMANENT;
+	netlink_init(RTM_NEWNEIGH, NLM_F_EXCL | NLM_F_CREATE, &hdr, sizeof(hdr));
+	netlink_attr(NDA_DST, addr, addrsize);
+	netlink_attr(NDA_LLADDR, mac, macsize);
+	int err = netlink_send(sock);
+	debug("netlink: add neigh %s addr %d lladdr %d: %s\n",
+	      name, addrsize, macsize, strerror(err));
+	(void)err;
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/if.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <net/if_arp.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_RESET_NET_NAMESPACE)
-#include <linux/net.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_FAULT_INJECTION)
-#include <errno.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <sys/stat.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_open_dev) || defined(__NR_syz_open_procfs)
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_fuse_mount) || defined(__NR_syz_fuseblk_mount)
-#include <fcntl.h>
-#include <stdio.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_open_pts)
-#include <fcntl.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_kvm_setup_cpu)
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/kvm.h>
-#include <stdarg.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_init_net_socket)
-#include <fcntl.h>
-#include <sched.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#endif
-
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||      \
-    defined(SYZ_USE_TMP_DIR) || defined(SYZ_HANDLE_SEGV) || defined(SYZ_TUN_ENABLE) || \
-    defined(SYZ_SANDBOX_NAMESPACE) || defined(SYZ_SANDBOX_SETUID) ||                   \
-    defined(SYZ_SANDBOX_NONE) || defined(SYZ_FAULT_INJECTION) ||                       \
-    defined(__NR_syz_kvm_setup_cpu) || defined(__NR_syz_init_net_socket) && (defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_SANDBOX_NAMESPACE))
-// One does not simply exit.
-// _exit can in fact fail.
-// syzkaller did manage to generate a seccomp filter that prohibits exit_group syscall.
-// Previously, we get into infinite recursion via segv_handler in such case
-// and corrupted output_data, which does matter in our case since it is shared
-// with fuzzer process. Loop infinitely instead. Parent will kill us.
-// But one does not simply loop either. Compilers are sure that _exit never returns,
-// so they remove all code after _exit as dead. Call _exit via volatile indirection.
-// And this does not work as well. _exit has own handling of failing exit_group
-// in the form of HLT instruction, it will divert control flow from our loop.
-// So call the syscall directly.
-__attribute__((noreturn)) static void doexit(int status)
-{
-	volatile unsigned i;
-	syscall(__NR_exit_group, status);
-	for (i = 0;; i++) {
-	}
-}
-#endif
-
-#include "common.h"
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_HANDLE_SEGV)
-static __thread int skip_segv;
-static __thread jmp_buf segv_env;
-
-static void segv_handler(int sig, siginfo_t* info, void* uctx)
-{
-	// Generated programs can contain bad (unmapped/protected) addresses,
-	// which cause SIGSEGVs during copyin/copyout.
-	// This handler ignores such crashes to allow the program to proceed.
-	// We additionally opportunistically check that the faulty address
-	// is not within executable data region, because such accesses can corrupt
-	// output region and then fuzzer will fail on corrupted data.
-	uintptr_t addr = (uintptr_t)info->si_addr;
-	const uintptr_t prog_start = 1 << 20;
-	const uintptr_t prog_end = 100 << 20;
-	if (__atomic_load_n(&skip_segv, __ATOMIC_RELAXED) && (addr < prog_start || addr > prog_end)) {
-		debug("SIGSEGV on %p, skipping\n", (void*)addr);
-		_longjmp(segv_env, 1);
-	}
-	debug("SIGSEGV on %p, exiting\n", (void*)addr);
-	doexit(sig);
-}
-
-static void install_segv_handler()
-{
-	struct sigaction sa;
-
-	// Don't need that SIGCANCEL/SIGSETXID glibc stuff.
-	// SIGCANCEL sent to main thread causes it to exit
-	// without bringing down the whole group.
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = SIG_IGN;
-	syscall(SYS_rt_sigaction, 0x20, &sa, NULL, 8);
-	syscall(SYS_rt_sigaction, 0x21, &sa, NULL, 8);
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = segv_handler;
-	sa.sa_flags = SA_NODEFER | SA_SIGINFO;
-	sigaction(SIGSEGV, &sa, NULL);
-	sigaction(SIGBUS, &sa, NULL);
-}
-
-#define NONFAILING(...)                                              \
-	{                                                            \
-		__atomic_fetch_add(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-		if (_setjmp(segv_env) == 0) {                        \
-			__VA_ARGS__;                                 \
-		}                                                    \
-		__atomic_fetch_sub(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-	}
-#endif
-
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-static uint64 current_time_ms()
-{
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts))
-		fail("clock_gettime failed");
-	return (uint64)ts.tv_sec * 1000 + (uint64)ts.tv_nsec / 1000000;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR)
-static void sleep_ms(uint64 ms)
-{
-	usleep(ms * 1000);
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_USE_TMP_DIR)
-static void use_temporary_dir()
-{
-	char tmpdir_template[] = "./syzkaller.XXXXXX";
-	char* tmpdir = mkdtemp(tmpdir_template);
-	if (!tmpdir)
-		fail("failed to mkdtemp");
-	if (chmod(tmpdir, 0777))
-		fail("failed to chmod");
-	if (chdir(tmpdir))
-		fail("failed to chdir");
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_TUN_ENABLE)
-static void vsnprintf_check(char* str, size_t size, const char* format, va_list args)
-{
-	int rv;
-
-	rv = vsnprintf(str, size, format, args);
-	if (rv < 0)
-		fail("tun: snprintf failed");
-	if ((size_t)rv >= size)
-		fail("tun: string '%s...' doesn't fit into buffer", str);
-}
-
-static void snprintf_check(char* str, size_t size, const char* format, ...)
-{
-	va_list args;
-
-	va_start(args, format);
-	vsnprintf_check(str, size, format, args);
-	va_end(args);
-}
-
-#define COMMAND_MAX_LEN 128
-#define PATH_PREFIX "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
-#define PATH_PREFIX_LEN (sizeof(PATH_PREFIX) - 1)
-
-static void execute_command(bool panic, const char* format, ...)
-{
-	va_list args;
-	char command[PATH_PREFIX_LEN + COMMAND_MAX_LEN];
-	int rv;
-
-	va_start(args, format);
-	// Executor process does not have any env, including PATH.
-	// On some distributions, system/shell adds a minimal PATH, on some it does not.
-	// Set own standard PATH to make it work across distributions.
-	memcpy(command, PATH_PREFIX, PATH_PREFIX_LEN);
-	vsnprintf_check(command + PATH_PREFIX_LEN, COMMAND_MAX_LEN, format, args);
-	rv = system(command);
-	if (panic && rv != 0)
-		fail("tun: command \"%s\" failed with code %d", &command[0], rv);
-
-	va_end(args);
-}
 
 static int tunfd = -1;
 static int tun_frags_enabled;
@@ -284,8 +334,8 @@ static int tun_frags_enabled;
 
 #define TUN_IFACE "syz_tun"
 
-#define LOCAL_MAC "aa:aa:aa:aa:aa:aa"
-#define REMOTE_MAC "aa:aa:aa:aa:aa:bb"
+#define LOCAL_MAC 0xaaaaaaaaaaaa
+#define REMOTE_MAC 0xaaaaaaaaaabb
 
 #define LOCAL_IPV4 "172.20.20.170"
 #define REMOTE_IPV4 "172.20.20.187"
@@ -300,20 +350,16 @@ static int tun_frags_enabled;
 #define IFF_NAPI_FRAGS 0x0020
 #endif
 
-#ifdef SYZ_EXECUTOR
-extern bool flag_enable_tun;
-#endif
-
 static void initialize_tun(void)
 {
-#ifdef SYZ_EXECUTOR
+#if SYZ_EXECUTOR
 	if (!flag_enable_tun)
 		return;
 #endif
 	tunfd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
 	if (tunfd == -1) {
-#ifdef SYZ_EXECUTOR
-		fail("tun: can't open /dev/net/tun\n");
+#if SYZ_EXECUTOR
+		fail("tun: can't open /dev/net/tun");
 #else
 		printf("tun: can't open /dev/net/tun: please enable CONFIG_TUN=y\n");
 		printf("otherwise fuzzing or reproducing might not work as intended\n");
@@ -321,8 +367,8 @@ static void initialize_tun(void)
 #endif
 	}
 	// Remap tun onto higher fd number to hide it from fuzzer and to keep
-	// fd numbers stable regardless of whether tun is opened or not.
-	const int kTunFd = 252;
+	// fd numbers stable regardless of whether tun is opened or not (also see kMaxFd).
+	const int kTunFd = 240;
 	if (dup2(tunfd, kTunFd) < 0)
 		fail("dup2(tunfd, kTunFd) failed");
 	close(tunfd);
@@ -346,62 +392,245 @@ static void initialize_tun(void)
 	debug("tun_frags_enabled=%d\n", tun_frags_enabled);
 
 	// Disable IPv6 DAD, otherwise the address remains unusable until DAD completes.
-	execute_command(1, "sysctl -w net.ipv6.conf.%s.accept_dad=0", TUN_IFACE);
-
+	// Don't panic because this is an optional config.
+	char sysctl[64];
+	sprintf(sysctl, "/proc/sys/net/ipv6/conf/%s/accept_dad", TUN_IFACE);
+	write_file(sysctl, "0");
 	// Disable IPv6 router solicitation to prevent IPv6 spam.
-	execute_command(1, "sysctl -w net.ipv6.conf.%s.router_solicitations=0", TUN_IFACE);
+	// Don't panic because this is an optional config.
+	sprintf(sysctl, "/proc/sys/net/ipv6/conf/%s/router_solicitations", TUN_IFACE);
+	write_file(sysctl, "0");
 	// There seems to be no way to disable IPv6 MTD to prevent more IPv6 spam.
 
-	execute_command(1, "ip link set dev %s address %s", TUN_IFACE, LOCAL_MAC);
-	execute_command(1, "ip addr add %s/24 dev %s", LOCAL_IPV4, TUN_IFACE);
-	execute_command(1, "ip -6 addr add %s/120 dev %s", LOCAL_IPV6, TUN_IFACE);
-	execute_command(1, "ip neigh add %s lladdr %s dev %s nud permanent",
-			REMOTE_IPV4, REMOTE_MAC, TUN_IFACE);
-	execute_command(1, "ip -6 neigh add %s lladdr %s dev %s nud permanent",
-			REMOTE_IPV6, REMOTE_MAC, TUN_IFACE);
-	execute_command(1, "ip link set dev %s up", TUN_IFACE);
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock == -1)
+		fail("socket(AF_NETLINK) failed");
+
+	netlink_add_addr4(sock, TUN_IFACE, LOCAL_IPV4);
+	netlink_add_addr6(sock, TUN_IFACE, LOCAL_IPV6);
+	uint64 macaddr = REMOTE_MAC;
+	struct in_addr in_addr;
+	inet_pton(AF_INET, REMOTE_IPV4, &in_addr);
+	netlink_add_neigh(sock, TUN_IFACE, &in_addr, sizeof(in_addr), &macaddr, ETH_ALEN);
+	struct in6_addr in6_addr;
+	inet_pton(AF_INET6, REMOTE_IPV6, &in6_addr);
+	netlink_add_neigh(sock, TUN_IFACE, &in6_addr, sizeof(in6_addr), &macaddr, ETH_ALEN);
+	macaddr = LOCAL_MAC;
+	netlink_device_change(sock, TUN_IFACE, true, 0, &macaddr, ETH_ALEN);
+	close(sock);
 }
+#endif
+
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+
+#include <linux/if_ether.h>
+#include <linux/if_tun.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
 
 // Addresses are chosen to be in the same subnet as tun addresses.
 #define DEV_IPV4 "172.20.20.%d"
-#define DEV_IPV6 "fe80::%02hx"
-#define DEV_MAC "aa:aa:aa:aa:aa:%02hx"
+#define DEV_IPV6 "fe80::%02x"
+#define DEV_MAC 0x00aaaaaaaaaa
 
 // We test in a separate namespace, which does not have any network devices initially (even lo).
 // Create/up as many as we can.
 static void initialize_netdevices(void)
 {
-	unsigned i;
-	const char* devtypes[] = {"ip6gretap", "bridge", "vcan", "bond", "veth"};
-	const char* devnames[] = {"lo", "sit0", "bridge0", "vcan0", "tunl0",
-				  "gre0", "gretap0", "ip_vti0", "ip6_vti0",
-				  "ip6tnl0", "ip6gre0", "ip6gretap0",
-				  "erspan0", "bond0", "veth0", "veth1"};
-
-#ifdef SYZ_EXECUTOR
-	if (!flag_enable_tun)
+#if SYZ_EXECUTOR
+	if (!flag_enable_net_dev)
 		return;
 #endif
-	for (i = 0; i < sizeof(devtypes) / (sizeof(devtypes[0])); i++)
-		execute_command(0, "ip link add dev %s0 type %s", devtypes[i], devtypes[i]);
-	execute_command(0, "ip link add dev veth1 type veth");
-	for (i = 0; i < sizeof(devnames) / (sizeof(devnames[0])); i++) {
-		char addr[32];
-		// Assign some unique address to devices. Some devices won't up without this.
-		// Devices that don't need these addresses will simply ignore them.
-		// Shift addresses by 10 because 0 subnet address can mean special things.
-		snprintf_check(addr, sizeof(addr), DEV_IPV4, i + 10);
-		execute_command(0, "ip -4 addr add %s/24 dev %s", addr, devnames[i]);
-		snprintf_check(addr, sizeof(addr), DEV_IPV6, i + 10);
-		execute_command(0, "ip -6 addr add %s/120 dev %s", addr, devnames[i]);
-		snprintf_check(addr, sizeof(addr), DEV_MAC, i + 10);
-		execute_command(0, "ip link set dev %s address %s", devnames[i], addr);
-		execute_command(0, "ip link set dev %s up", devnames[i]);
+	// TODO: add the following devices:
+	// - vlan
+	// - vxlan
+	// - macvlan
+	// - ipvlan
+	// - macsec
+	// - ipip
+	// - lowpan
+	// - ipoib
+	// - geneve
+	// - vrf
+	// - rmnet
+	// - openvswitch
+	// Naive attempts to add devices of these types fail with various errors.
+	// Also init namespace contains the following devices (which presumably can't be
+	// created in non-init namespace), can we use them somehow?
+	// - ifb0/1
+	// - wpan0/1
+	// - hwsim0
+	// - teql0
+	// - eql
+	char netdevsim[16];
+	sprintf(netdevsim, "netdevsim%d", (int)procid);
+	struct {
+		const char* type;
+		const char* dev;
+	} devtypes[] = {
+	    // Note: ip6erspan device can't be added if ip6gretap exists in the same namespace.
+	    {"ip6gretap", "ip6gretap0"},
+	    {"bridge", "bridge0"},
+	    {"vcan", "vcan0"},
+	    {"bond", "bond0"},
+	    {"team", "team0"},
+	    {"dummy", "dummy0"},
+	    {"nlmon", "nlmon0"},
+	    {"caif", "caif0"},
+	    {"batadv", "batadv0"},
+	    // Note: adding device vxcan0 fails.
+	    {"vxcan", "vxcan1"},
+	    // Note: netdevsim devices can't have the same name even in different namespaces.
+	    {"netdevsim", netdevsim},
+	    // This adds connected veth0 and veth1 devices.
+	    {"veth", 0},
+	};
+	const char* devmasters[] = {"bridge", "bond", "team"};
+	// If you extend this array, also update netdev_addr_id in vnet.txt.
+	struct {
+		const char* name;
+		int macsize;
+		bool noipv6;
+	} devices[] = {
+	    {"lo", ETH_ALEN},
+	    {"sit0", 0},
+	    {"bridge0", ETH_ALEN},
+	    {"vcan0", 0, true},
+	    {"tunl0", 0},
+	    {"gre0", 0},
+	    {"gretap0", ETH_ALEN},
+	    {"ip_vti0", 0},
+	    {"ip6_vti0", 0},
+	    {"ip6tnl0", 0},
+	    {"ip6gre0", 0},
+	    {"ip6gretap0", ETH_ALEN},
+	    {"erspan0", ETH_ALEN},
+	    {"bond0", ETH_ALEN},
+	    {"veth0", ETH_ALEN},
+	    {"veth1", ETH_ALEN},
+	    {"team0", ETH_ALEN},
+	    {"veth0_to_bridge", ETH_ALEN},
+	    {"veth1_to_bridge", ETH_ALEN},
+	    {"veth0_to_bond", ETH_ALEN},
+	    {"veth1_to_bond", ETH_ALEN},
+	    {"veth0_to_team", ETH_ALEN},
+	    {"veth1_to_team", ETH_ALEN},
+	    {"veth0_to_hsr", ETH_ALEN},
+	    {"veth1_to_hsr", ETH_ALEN},
+	    {"hsr0", 0},
+	    {"dummy0", ETH_ALEN},
+	    {"nlmon0", 0},
+	    {"vxcan1", 0, true},
+	    {"caif0", ETH_ALEN}, // TODO: up'ing caif fails with ENODEV
+	    {"batadv0", ETH_ALEN},
+	    {netdevsim, ETH_ALEN},
+	};
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock == -1)
+		fail("socket(AF_NETLINK) failed");
+	unsigned i;
+	for (i = 0; i < sizeof(devtypes) / sizeof(devtypes[0]); i++)
+		netlink_add_device(sock, devtypes[i].type, devtypes[i].dev);
+	// This creates connected bridge/bond/team_slave devices of type veth,
+	// and makes them slaves of bridge/bond/team devices, respectively.
+	// Note: slave devices don't need MAC/IP addresses, only master devices.
+	//       veth0_to_* is not slave devices, which still need ip addresses.
+	for (i = 0; i < sizeof(devmasters) / (sizeof(devmasters[0])); i++) {
+		char master[32], slave0[32], veth0[32], slave1[32], veth1[32];
+		sprintf(slave0, "%s_slave_0", devmasters[i]);
+		sprintf(veth0, "veth0_to_%s", devmasters[i]);
+		netlink_add_veth(sock, slave0, veth0);
+		sprintf(slave1, "%s_slave_1", devmasters[i]);
+		sprintf(veth1, "veth1_to_%s", devmasters[i]);
+		netlink_add_veth(sock, slave1, veth1);
+		sprintf(master, "%s0", devmasters[i]);
+		netlink_device_change(sock, slave0, false, master, 0, 0);
+		netlink_device_change(sock, slave1, false, master, 0, 0);
 	}
+	// bond/team_slave_* will set up automatically when set their master.
+	// But bridge_slave_* need to set up manually.
+	netlink_device_change(sock, "bridge_slave_0", true, 0, 0, 0);
+	netlink_device_change(sock, "bridge_slave_1", true, 0, 0, 0);
+
+	// Setup hsr device (slightly different from what we do for devmasters).
+	netlink_add_veth(sock, "hsr_slave_0", "veth0_to_hsr");
+	netlink_add_veth(sock, "hsr_slave_1", "veth1_to_hsr");
+	netlink_add_hsr(sock, "hsr0", "hsr_slave_0", "hsr_slave_1");
+	netlink_device_change(sock, "hsr_slave_0", true, 0, 0, 0);
+	netlink_device_change(sock, "hsr_slave_1", true, 0, 0, 0);
+
+	for (i = 0; i < sizeof(devices) / (sizeof(devices[0])); i++) {
+		// Assign some unique address to devices. Some devices won't up without this.
+		// Shift addresses by 10 because 0 subnet address can mean special things.
+		char addr[32];
+		sprintf(addr, DEV_IPV4, i + 10);
+		netlink_add_addr4(sock, devices[i].name, addr);
+		if (!devices[i].noipv6) {
+			sprintf(addr, DEV_IPV6, i + 10);
+			netlink_add_addr6(sock, devices[i].name, addr);
+		}
+		uint64 macaddr = DEV_MAC + ((i + 10ull) << 40);
+		netlink_device_change(sock, devices[i].name, true, 0, &macaddr, devices[i].macsize);
+	}
+	close(sock);
+}
+
+// Same as initialize_netdevices, but called in init net namespace.
+static void initialize_netdevices_init(void)
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_net_dev)
+		return;
+#endif
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock == -1)
+		fail("socket(AF_NETLINK) failed");
+	struct {
+		const char* type;
+		int macsize;
+		bool noipv6;
+		bool noup;
+	} devtypes[] = {
+	    // NETROM device, see net/netrom/{af_netrom,nr_dev}.c
+	    {"nr", 7, true},
+	    // ROSE device, see net/rose/{af_rose,rose_dev}.c
+	    // We don't up it yet because it crashes kernel right away:
+	    // https://groups.google.com/d/msg/syzkaller/v-4B3zoBC-4/02SCKEzJBwAJ
+	    {"rose", 5, true, true},
+	};
+	unsigned i;
+	for (i = 0; i < sizeof(devtypes) / sizeof(devtypes[0]); i++) {
+		char dev[32], addr[32];
+		sprintf(dev, "%s%d", devtypes[i].type, (int)procid);
+		// Note: syscall descriptions know these addresses.
+		sprintf(addr, "172.30.%d.%d", i, (int)procid + 1);
+		netlink_add_addr4(sock, dev, addr);
+		if (!devtypes[i].noipv6) {
+			sprintf(addr, "fe88::%02x:%02x", i, (int)procid + 1);
+			netlink_add_addr6(sock, dev, addr);
+		}
+		int macsize = devtypes[i].macsize;
+		uint64 macaddr = 0xbbbbbb + ((unsigned long long)i << (8 * (macsize - 2))) +
+				 (procid << (8 * (macsize - 1)));
+		netlink_device_change(sock, dev, !devtypes[i].noup, 0, &macaddr, macsize);
+	}
+	close(sock);
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_TUN_ENABLE) && (defined(__NR_syz_extract_tcp_res) || defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)))
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE && (__NR_syz_extract_tcp_res || SYZ_REPEAT)
+#include <errno.h>
+
 static int read_tun(char* data, int size)
 {
 	if (tunfd < 0)
@@ -420,21 +649,10 @@ static int read_tun(char* data, int size)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_DEBUG) && defined(SYZ_TUN_ENABLE) && (defined(__NR_syz_emit_ethernet) || defined(__NR_syz_extract_tcp_res)))
-static void debug_dump_data(const char* data, int length)
-{
-	int i;
-	for (i = 0; i < length; i++) {
-		debug("%02x ", data[i] & 0xff);
-		if (i % 16 == 15)
-			debug("\n");
-	}
-	if (i % 16 != 0)
-		debug("\n");
-}
-#endif
+#if SYZ_EXECUTOR || __NR_syz_emit_ethernet && SYZ_TUN_ENABLE
+#include <stdbool.h>
+#include <sys/uio.h>
 
-#if defined(SYZ_EXECUTOR) || (defined(__NR_syz_emit_ethernet) && defined(SYZ_TUN_ENABLE))
 #define MAX_FRAGS 4
 struct vnet_fragmentation {
 	uint32 full;
@@ -442,7 +660,7 @@ struct vnet_fragmentation {
 	uint32 frags[MAX_FRAGS];
 };
 
-static uintptr_t syz_emit_ethernet(uintptr_t a0, uintptr_t a1, uintptr_t a2)
+static long syz_emit_ethernet(volatile long a0, volatile long a1, volatile long a2)
 {
 	// syz_emit_ethernet(len len[packet], packet ptr[in, eth_packet], frags ptr[in, vnet_fragmentation, opt])
 	// vnet_fragmentation {
@@ -492,16 +710,20 @@ static uintptr_t syz_emit_ethernet(uintptr_t a0, uintptr_t a1, uintptr_t a2)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_TUN_ENABLE))
+#if SYZ_EXECUTOR || SYZ_REPEAT && SYZ_TUN_ENABLE
 static void flush_tun()
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_tun)
+		return;
+#endif
 	char data[SYZ_TUN_MAX_PACKET_SIZE];
-	while (read_tun(&data[0], sizeof(data)) != -1)
-		;
+	while (read_tun(&data[0], sizeof(data)) != -1) {
+	}
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(__NR_syz_extract_tcp_res) && defined(SYZ_TUN_ENABLE))
+#if SYZ_EXECUTOR || __NR_syz_extract_tcp_res && SYZ_TUN_ENABLE
 #ifndef __ANDROID__
 // Can't include <linux/ipv6.h>, since it causes
 // conflicts due to some structs redefinition.
@@ -524,7 +746,7 @@ struct tcp_resources {
 	uint32 ack;
 };
 
-static uintptr_t syz_extract_tcp_res(uintptr_t a0, uintptr_t a1, uintptr_t a2)
+static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile long a2)
 {
 	// syz_extract_tcp_res(res ptr[out, tcp_resources], seq_inc int32, ack_inc int32)
 
@@ -576,8 +798,13 @@ static uintptr_t syz_extract_tcp_res(uintptr_t a0, uintptr_t a1, uintptr_t a2)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_open_dev)
-static uintptr_t syz_open_dev(uintptr_t a0, uintptr_t a1, uintptr_t a2)
+#if SYZ_EXECUTOR || __NR_syz_open_dev
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static long syz_open_dev(volatile long a0, volatile long a1, volatile long a2)
 {
 	if (a0 == 0xc || a0 == 0xb) {
 		// syz_open_dev$char(dev const[0xc], major intptr, minor intptr) fd
@@ -589,7 +816,7 @@ static uintptr_t syz_open_dev(uintptr_t a0, uintptr_t a1, uintptr_t a2)
 		// syz_open_dev(dev strconst, id intptr, flags flags[open_flags]) fd
 		char buf[1024];
 		char* hash;
-		NONFAILING(strncpy(buf, (char*)a0, sizeof(buf)));
+		NONFAILING(strncpy(buf, (char*)a0, sizeof(buf) - 1));
 		buf[sizeof(buf) - 1] = 0;
 		while ((hash = strchr(buf, '#'))) {
 			*hash = '0' + (char)(a1 % 10); // 10 devices should be enough for everyone.
@@ -600,8 +827,13 @@ static uintptr_t syz_open_dev(uintptr_t a0, uintptr_t a1, uintptr_t a2)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_open_procfs)
-static uintptr_t syz_open_procfs(uintptr_t a0, uintptr_t a1)
+#if SYZ_EXECUTOR || __NR_syz_open_procfs
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static long syz_open_procfs(volatile long a0, volatile long a1)
 {
 	// syz_open_procfs(pid pid, file ptr[in, string[procfs_file]]) fd
 
@@ -609,7 +841,7 @@ static uintptr_t syz_open_procfs(uintptr_t a0, uintptr_t a1)
 	memset(buf, 0, sizeof(buf));
 	if (a0 == 0) {
 		NONFAILING(snprintf(buf, sizeof(buf), "/proc/self/%s", (char*)a1));
-	} else if (a0 == (uintptr_t)-1) {
+	} else if (a0 == -1) {
 		NONFAILING(snprintf(buf, sizeof(buf), "/proc/thread-self/%s", (char*)a1));
 	} else {
 		NONFAILING(snprintf(buf, sizeof(buf), "/proc/self/task/%d/%s", (int)a0, (char*)a1));
@@ -621,8 +853,13 @@ static uintptr_t syz_open_procfs(uintptr_t a0, uintptr_t a1)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_open_pts)
-static uintptr_t syz_open_pts(uintptr_t a0, uintptr_t a1)
+#if SYZ_EXECUTOR || __NR_syz_open_pts
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static long syz_open_pts(volatile long a0, volatile long a1)
 {
 	// syz_openpts(fd fd[tty], flags flags[open_flags]) fd[tty]
 	int ptyno = 0;
@@ -634,74 +871,18 @@ static uintptr_t syz_open_pts(uintptr_t a0, uintptr_t a1)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_fuse_mount)
-static uintptr_t syz_fuse_mount(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5)
-{
-	// syz_fuse_mount(target filename, mode flags[fuse_mode], uid uid, gid gid, maxread intptr, flags flags[mount_flags]) fd[fuse]
-	uint64 target = a0;
-	uint64 mode = a1;
-	uint64 uid = a2;
-	uint64 gid = a3;
-	uint64 maxread = a4;
-	uint64 flags = a5;
+#if SYZ_EXECUTOR || __NR_syz_init_net_socket
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-	int fd = open("/dev/fuse", O_RDWR);
-	if (fd == -1)
-		return fd;
-	char buf[1024];
-	sprintf(buf, "fd=%d,user_id=%ld,group_id=%ld,rootmode=0%o", fd, (long)uid, (long)gid, (unsigned)mode & ~3u);
-	if (maxread != 0)
-		sprintf(buf + strlen(buf), ",max_read=%ld", (long)maxread);
-	if (mode & 1)
-		strcat(buf, ",default_permissions");
-	if (mode & 2)
-		strcat(buf, ",allow_other");
-	syscall(SYS_mount, "", target, "fuse", flags, buf);
-	// Ignore errors, maybe fuzzer can do something useful with fd alone.
-	return fd;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_fuseblk_mount)
-static uintptr_t syz_fuseblk_mount(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7)
-{
-	// syz_fuseblk_mount(target filename, blkdev filename, mode flags[fuse_mode], uid uid, gid gid, maxread intptr, blksize intptr, flags flags[mount_flags]) fd[fuse]
-	uint64 target = a0;
-	uint64 blkdev = a1;
-	uint64 mode = a2;
-	uint64 uid = a3;
-	uint64 gid = a4;
-	uint64 maxread = a5;
-	uint64 blksize = a6;
-	uint64 flags = a7;
-
-	int fd = open("/dev/fuse", O_RDWR);
-	if (fd == -1)
-		return fd;
-	if (syscall(SYS_mknodat, AT_FDCWD, blkdev, S_IFBLK, makedev(7, 199)))
-		return fd;
-	char buf[256];
-	sprintf(buf, "fd=%d,user_id=%ld,group_id=%ld,rootmode=0%o", fd, (long)uid, (long)gid, (unsigned)mode & ~3u);
-	if (maxread != 0)
-		sprintf(buf + strlen(buf), ",max_read=%ld", (long)maxread);
-	if (blksize != 0)
-		sprintf(buf + strlen(buf), ",blksize=%ld", (long)blksize);
-	if (mode & 1)
-		strcat(buf, ",default_permissions");
-	if (mode & 2)
-		strcat(buf, ",allow_other");
-	syscall(SYS_mount, blkdev, target, "fuseblk", flags, buf);
-	// Ignore errors, maybe fuzzer can do something useful with fd alone.
-	return fd;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_init_net_socket)
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_SANDBOX_NAMESPACE)
-const int kInitNetNsFd = 253;
+const int kInitNetNsFd = 239; // see kMaxFd
 // syz_init_net_socket opens a socket in init net namespace.
 // Used for families that can only be created in init net namespace.
-static uintptr_t syz_init_net_socket(uintptr_t domain, uintptr_t type, uintptr_t proto)
+static long syz_init_net_socket(volatile long domain, volatile long type, volatile long proto)
 {
 	int netns = open("/proc/self/ns/net", O_RDONLY);
 	if (netns == -1)
@@ -717,283 +898,324 @@ static uintptr_t syz_init_net_socket(uintptr_t domain, uintptr_t type, uintptr_t
 	return sock;
 }
 #else
-static uintptr_t syz_init_net_socket(uintptr_t domain, uintptr_t type, uintptr_t proto)
+static long syz_init_net_socket(volatile long domain, volatile long type, volatile long proto)
 {
 	return syscall(__NR_socket, domain, type, proto);
 }
 #endif
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_kvm_setup_cpu)
-#if defined(__x86_64__)
+#if SYZ_EXECUTOR || __NR_syz_genetlink_get_family_id
+#include <errno.h>
+#include <linux/genetlink.h>
+#include <linux/netlink.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+static long syz_genetlink_get_family_id(volatile long name)
+{
+	char buf[512] = {0};
+	struct nlmsghdr* hdr = (struct nlmsghdr*)buf;
+	struct genlmsghdr* genlhdr = (struct genlmsghdr*)NLMSG_DATA(hdr);
+	struct nlattr* attr = (struct nlattr*)(genlhdr + 1);
+	hdr->nlmsg_len = sizeof(*hdr) + sizeof(*genlhdr) + sizeof(*attr) + GENL_NAMSIZ;
+	hdr->nlmsg_type = GENL_ID_CTRL;
+	hdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	genlhdr->cmd = CTRL_CMD_GETFAMILY;
+	attr->nla_type = CTRL_ATTR_FAMILY_NAME;
+	attr->nla_len = sizeof(*attr) + GENL_NAMSIZ;
+	NONFAILING(strncpy((char*)(attr + 1), (char*)name, GENL_NAMSIZ));
+	struct iovec iov = {hdr, hdr->nlmsg_len};
+	struct sockaddr_nl addr = {0};
+	addr.nl_family = AF_NETLINK;
+	debug("syz_genetlink_get_family_id(%s)\n", (char*)(attr + 1));
+	int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (fd == -1) {
+		debug("syz_genetlink_get_family_id: socket failed: %d\n", errno);
+		return -1;
+	}
+	struct msghdr msg = {&addr, sizeof(addr), &iov, 1, NULL, 0, 0};
+	if (sendmsg(fd, &msg, 0) == -1) {
+		debug("syz_genetlink_get_family_id: sendmsg failed: %d\n", errno);
+		close(fd);
+		return -1;
+	}
+	ssize_t n = recv(fd, buf, sizeof(buf), 0);
+	close(fd);
+	if (n <= 0) {
+		debug("syz_genetlink_get_family_id: recv failed: %d\n", errno);
+		return -1;
+	}
+	if (hdr->nlmsg_type != GENL_ID_CTRL) {
+		debug("syz_genetlink_get_family_id: wrong reply type: %d\n", hdr->nlmsg_type);
+		return -1;
+	}
+	for (; (char*)attr < buf + n; attr = (struct nlattr*)((char*)attr + NLMSG_ALIGN(attr->nla_len))) {
+		if (attr->nla_type == CTRL_ATTR_FAMILY_ID)
+			return *(uint16*)(attr + 1);
+	}
+	debug("syz_genetlink_get_family_id: no CTRL_ATTR_FAMILY_ID attr\n");
+	return -1;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mount_image || __NR_syz_read_part_table
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/loop.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+struct fs_image_segment {
+	void* data;
+	uintptr_t size;
+	uintptr_t offset;
+};
+
+#define IMAGE_MAX_SEGMENTS 4096
+#define IMAGE_MAX_SIZE (129 << 20)
+
+#if GOARCH_386
+#define SYZ_memfd_create 356
+#elif GOARCH_amd64
+#define SYZ_memfd_create 319
+#elif GOARCH_arm
+#define SYZ_memfd_create 385
+#elif GOARCH_arm64
+#define SYZ_memfd_create 279
+#elif GOARCH_ppc64le
+#define SYZ_memfd_create 360
+#endif
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_read_part_table
+// syz_read_part_table(size intptr, nsegs len[segments], segments ptr[in, array[fs_image_segment]])
+static long syz_read_part_table(volatile unsigned long size, volatile unsigned long nsegs, volatile long segments)
+{
+	char loopname[64], linkname[64];
+	int loopfd, err = 0, res = -1;
+	unsigned long i, j;
+	// See the comment in syz_mount_image.
+	struct fs_image_segment* segs = (struct fs_image_segment*)segments;
+
+	if (nsegs > IMAGE_MAX_SEGMENTS)
+		nsegs = IMAGE_MAX_SEGMENTS;
+	for (i = 0; i < nsegs; i++) {
+		if (segs[i].size > IMAGE_MAX_SIZE)
+			segs[i].size = IMAGE_MAX_SIZE;
+		segs[i].offset %= IMAGE_MAX_SIZE;
+		if (segs[i].offset > IMAGE_MAX_SIZE - segs[i].size)
+			segs[i].offset = IMAGE_MAX_SIZE - segs[i].size;
+		if (size < segs[i].offset + segs[i].offset)
+			size = segs[i].offset + segs[i].offset;
+	}
+	if (size > IMAGE_MAX_SIZE)
+		size = IMAGE_MAX_SIZE;
+	int memfd = syscall(SYZ_memfd_create, "syz_read_part_table", 0);
+	if (memfd == -1) {
+		err = errno;
+		goto error;
+	}
+	if (ftruncate(memfd, size)) {
+		err = errno;
+		goto error_close_memfd;
+	}
+	for (i = 0; i < nsegs; i++) {
+		if (pwrite(memfd, segs[i].data, segs[i].size, segs[i].offset) < 0) {
+			debug("syz_read_part_table: pwrite[%u] failed: %d\n", (int)i, errno);
+		}
+	}
+	snprintf(loopname, sizeof(loopname), "/dev/loop%llu", procid);
+	loopfd = open(loopname, O_RDWR);
+	if (loopfd == -1) {
+		err = errno;
+		goto error_close_memfd;
+	}
+	if (ioctl(loopfd, LOOP_SET_FD, memfd)) {
+		if (errno != EBUSY) {
+			err = errno;
+			goto error_close_loop;
+		}
+		ioctl(loopfd, LOOP_CLR_FD, 0);
+		usleep(1000);
+		if (ioctl(loopfd, LOOP_SET_FD, memfd)) {
+			err = errno;
+			goto error_close_loop;
+		}
+	}
+	struct loop_info64 info;
+	if (ioctl(loopfd, LOOP_GET_STATUS64, &info)) {
+		err = errno;
+		goto error_clear_loop;
+	}
+#if SYZ_EXECUTOR
+	cover_reset(0);
+#endif
+	info.lo_flags |= LO_FLAGS_PARTSCAN;
+	if (ioctl(loopfd, LOOP_SET_STATUS64, &info)) {
+		err = errno;
+		goto error_clear_loop;
+	}
+	res = 0;
+	// If we managed to parse some partitions, symlink them into our work dir.
+	for (i = 1, j = 0; i < 8; i++) {
+		snprintf(loopname, sizeof(loopname), "/dev/loop%llup%d", procid, (int)i);
+		struct stat statbuf;
+		if (stat(loopname, &statbuf) == 0) {
+			snprintf(linkname, sizeof(linkname), "./file%d", (int)j++);
+			if (symlink(loopname, linkname)) {
+				debug("syz_read_part_table: symlink(%s, %s) failed: %d\n", loopname, linkname, errno);
+			}
+		}
+	}
+error_clear_loop:
+	ioctl(loopfd, LOOP_CLR_FD, 0);
+error_close_loop:
+	close(loopfd);
+error_close_memfd:
+	close(memfd);
+error:
+	errno = err;
+	return res;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mount_image
+#include <string.h>
+#include <sys/mount.h>
+
+//syz_mount_image(fs ptr[in, string[disk_filesystems]], dir ptr[in, filename], size intptr, nsegs len[segments], segments ptr[in, array[fs_image_segment]], flags flags[mount_flags], opts ptr[in, fs_options[vfat_options]])
+//fs_image_segment {
+//	data	ptr[in, array[int8]]
+//	size	len[data, intptr]
+//	offset	intptr
+//}
+static long syz_mount_image(volatile long fsarg, volatile long dir, volatile unsigned long size, volatile unsigned long nsegs, volatile long segments, volatile long flags, volatile long optsarg)
+{
+	char loopname[64], fs[32], opts[256];
+	int loopfd, err = 0, res = -1;
+	unsigned long i;
+	// Strictly saying we ought to do a nonfailing copyout of segments into a local var.
+	// But some filesystems have large number of segments (2000+),
+	// we can't allocate that much on stack and allocating elsewhere is problematic,
+	// so we just use the memory allocated by fuzzer.
+	struct fs_image_segment* segs = (struct fs_image_segment*)segments;
+
+	if (nsegs > IMAGE_MAX_SEGMENTS)
+		nsegs = IMAGE_MAX_SEGMENTS;
+	for (i = 0; i < nsegs; i++) {
+		if (segs[i].size > IMAGE_MAX_SIZE)
+			segs[i].size = IMAGE_MAX_SIZE;
+		segs[i].offset %= IMAGE_MAX_SIZE;
+		if (segs[i].offset > IMAGE_MAX_SIZE - segs[i].size)
+			segs[i].offset = IMAGE_MAX_SIZE - segs[i].size;
+		if (size < segs[i].offset + segs[i].offset)
+			size = segs[i].offset + segs[i].offset;
+	}
+	if (size > IMAGE_MAX_SIZE)
+		size = IMAGE_MAX_SIZE;
+	int memfd = syscall(SYZ_memfd_create, "syz_mount_image", 0);
+	if (memfd == -1) {
+		err = errno;
+		goto error;
+	}
+	if (ftruncate(memfd, size)) {
+		err = errno;
+		goto error_close_memfd;
+	}
+	for (i = 0; i < nsegs; i++) {
+		if (pwrite(memfd, segs[i].data, segs[i].size, segs[i].offset) < 0) {
+			debug("syz_mount_image: pwrite[%u] failed: %d\n", (int)i, errno);
+		}
+	}
+	snprintf(loopname, sizeof(loopname), "/dev/loop%llu", procid);
+	loopfd = open(loopname, O_RDWR);
+	if (loopfd == -1) {
+		err = errno;
+		goto error_close_memfd;
+	}
+	if (ioctl(loopfd, LOOP_SET_FD, memfd)) {
+		if (errno != EBUSY) {
+			err = errno;
+			goto error_close_loop;
+		}
+		ioctl(loopfd, LOOP_CLR_FD, 0);
+		usleep(1000);
+		if (ioctl(loopfd, LOOP_SET_FD, memfd)) {
+			err = errno;
+			goto error_close_loop;
+		}
+	}
+	mkdir((char*)dir, 0777);
+	memset(fs, 0, sizeof(fs));
+	NONFAILING(strncpy(fs, (char*)fsarg, sizeof(fs) - 1));
+	memset(opts, 0, sizeof(opts));
+	// Leave some space for the additional options we append below.
+	NONFAILING(strncpy(opts, (char*)optsarg, sizeof(opts) - 32));
+	if (strcmp(fs, "iso9660") == 0) {
+		flags |= MS_RDONLY;
+	} else if (strncmp(fs, "ext", 3) == 0) {
+		// For ext2/3/4 we have to have errors=continue because the image
+		// can contain errors=panic flag and can legally crash kernel.
+		if (strstr(opts, "errors=panic") || strstr(opts, "errors=remount-ro") == 0)
+			strcat(opts, ",errors=continue");
+	} else if (strcmp(fs, "xfs") == 0) {
+		// For xfs we need nouuid because xfs has a global uuids table
+		// and if two parallel executors mounts fs with the same uuid, second mount fails.
+		strcat(opts, ",nouuid");
+	}
+	debug("syz_mount_image: size=%llu segs=%llu loop='%s' dir='%s' fs='%s' flags=%llu opts='%s'\n", (uint64)size, (uint64)nsegs, loopname, (char*)dir, fs, (uint64)flags, opts);
+#if SYZ_EXECUTOR
+	cover_reset(0);
+#endif
+	if (mount(loopname, (char*)dir, fs, flags, opts)) {
+		err = errno;
+		goto error_clear_loop;
+	}
+	res = 0;
+error_clear_loop:
+	ioctl(loopfd, LOOP_CLR_FD, 0);
+error_close_loop:
+	close(loopfd);
+error_close_memfd:
+	close(memfd);
+error:
+	errno = err;
+	return res;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_kvm_setup_cpu
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/kvm.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+
+#if GOARCH_amd64
 #include "common_kvm_amd64.h"
-#elif defined(__aarch64__)
+#elif GOARCH_arm64
 #include "common_kvm_arm64.h"
 #else
-static uintptr_t syz_kvm_setup_cpu(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7)
+static long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5, volatile long a6, volatile long a7)
 {
 	return 0;
 }
 #endif
-#endif // #ifdef __NR_syz_kvm_setup_cpu
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_SANDBOX_NAMESPACE)
-static void loop();
-
-static void sandbox_common()
-{
-	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-	setpgrp();
-	setsid();
-
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_init_net_socket)
-	int netns = open("/proc/self/ns/net", O_RDONLY);
-	if (netns == -1)
-		fail("open(/proc/self/ns/net) failed");
-	if (dup2(netns, kInitNetNsFd) < 0)
-		fail("dup2(netns, kInitNetNsFd) failed");
-	close(netns);
 #endif
 
-	struct rlimit rlim;
-	rlim.rlim_cur = rlim.rlim_max = 128 << 20;
-	setrlimit(RLIMIT_AS, &rlim);
-	rlim.rlim_cur = rlim.rlim_max = 8 << 20;
-	setrlimit(RLIMIT_MEMLOCK, &rlim);
-	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
-	setrlimit(RLIMIT_FSIZE, &rlim);
-	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
-	setrlimit(RLIMIT_STACK, &rlim);
-	rlim.rlim_cur = rlim.rlim_max = 0;
-	setrlimit(RLIMIT_CORE, &rlim);
+#if SYZ_EXECUTOR || SYZ_RESET_NET_NAMESPACE
+#include <errno.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
 
-#ifndef CLONE_NEWCGROUP
-#define CLONE_NEWCGROUP 0x02000000
-#endif
+#include <linux/net.h>
 
-	// CLONE_NEWNS/NEWCGROUP cause EINVAL on some systems,
-	// so we do them separately of clone in do_sandbox_namespace.
-	if (unshare(CLONE_NEWNS)) {
-		debug("unshare(CLONE_NEWNS): %d\n", errno);
-	}
-	if (unshare(CLONE_NEWIPC)) {
-		debug("unshare(CLONE_NEWIPC): %d\n", errno);
-	}
-	if (unshare(CLONE_NEWCGROUP)) {
-		debug("unshare(CLONE_NEWCGROUP): %d\n", errno);
-	}
-	if (unshare(CLONE_NEWUTS)) {
-		debug("unshare(CLONE_NEWUTS): %d\n", errno);
-	}
-	if (unshare(CLONE_SYSVSEM)) {
-		debug("unshare(CLONE_SYSVSEM): %d\n", errno);
-	}
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NONE)
-static int do_sandbox_none(void)
-{
-	// CLONE_NEWPID takes effect for the first child of the current process,
-	// so we do it before fork to make the loop "init" process of the namespace.
-	// We ought to do fail here, but sandbox=none is used in pkg/ipc tests
-	// and they are usually run under non-root.
-	// Also since debug is stripped by pkg/csource, we need to do {}
-	// even though we generally don't do {} around single statements.
-	if (unshare(CLONE_NEWPID)) {
-		debug("unshare(CLONE_NEWPID): %d\n", errno);
-	}
-	int pid = fork();
-	if (pid < 0)
-		fail("sandbox fork failed");
-	if (pid)
-		return pid;
-
-	sandbox_common();
-	if (unshare(CLONE_NEWNET)) {
-		debug("unshare(CLONE_NEWNET): %d\n", errno);
-	}
-#if defined(SYZ_EXECUTOR) || defined(SYZ_TUN_ENABLE)
-	initialize_tun();
-	// TODO(dvyukov): this should be separated from tun and minimized by csource separately.
-	initialize_netdevices();
-#endif
-
-	loop();
-	doexit(1);
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_SETUID)
-static int do_sandbox_setuid(void)
-{
-	if (unshare(CLONE_NEWPID))
-		fail("unshare(CLONE_NEWPID)");
-	int pid = fork();
-	if (pid < 0)
-		fail("sandbox fork failed");
-	if (pid)
-		return pid;
-
-	sandbox_common();
-	if (unshare(CLONE_NEWNET))
-		fail("unshare(CLONE_NEWNET)");
-#if defined(SYZ_EXECUTOR) || defined(SYZ_TUN_ENABLE)
-	initialize_tun();
-	// TODO(dvyukov): this should be separated from tun and minimized by csource separately.
-	initialize_netdevices();
-#endif
-
-	const int nobody = 65534;
-	if (setgroups(0, NULL))
-		fail("failed to setgroups");
-	if (syscall(SYS_setresgid, nobody, nobody, nobody))
-		fail("failed to setresgid");
-	if (syscall(SYS_setresuid, nobody, nobody, nobody))
-		fail("failed to setresuid");
-
-	// This is required to open /proc/self/* files.
-	// Otherwise they are owned by root and we can't open them after setuid.
-	// See task_dump_owner function in kernel.
-	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
-
-	loop();
-	doexit(1);
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NAMESPACE) || defined(SYZ_FAULT_INJECTION)
-static bool write_file(const char* file, const char* what, ...)
-{
-	char buf[1024];
-	va_list args;
-	va_start(args, what);
-	vsnprintf(buf, sizeof(buf), what, args);
-	va_end(args);
-	buf[sizeof(buf) - 1] = 0;
-	int len = strlen(buf);
-
-	int fd = open(file, O_WRONLY | O_CLOEXEC);
-	if (fd == -1)
-		return false;
-	if (write(fd, buf, len) != len) {
-		close(fd);
-		return false;
-	}
-	close(fd);
-	return true;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_SANDBOX_NAMESPACE)
-static int real_uid;
-static int real_gid;
-__attribute__((aligned(64 << 10))) static char sandbox_stack[1 << 20];
-
-static int namespace_sandbox_proc(void* arg)
-{
-	sandbox_common();
-
-	// /proc/self/setgroups is not present on some systems, ignore error.
-	write_file("/proc/self/setgroups", "deny");
-	if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid))
-		fail("write of /proc/self/uid_map failed");
-	if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid))
-		fail("write of /proc/self/gid_map failed");
-
-	// CLONE_NEWNET must always happen before tun setup,
-	// because we want the tun device in the test namespace.
-	if (unshare(CLONE_NEWNET))
-		fail("unshare(CLONE_NEWNET)");
-#if defined(SYZ_EXECUTOR) || defined(SYZ_TUN_ENABLE)
-	// We setup tun here as it needs to be in the test net namespace,
-	// which in turn needs to be in the test user namespace.
-	// However, IFF_NAPI_FRAGS will fail as we are not root already.
-	// There does not seem to be a call sequence that would satisfy all of that.
-	initialize_tun();
-	// TODO(dvyukov): this should be separated from tun and minimized by csource separately.
-	initialize_netdevices();
-#endif
-
-	if (mkdir("./syz-tmp", 0777))
-		fail("mkdir(syz-tmp) failed");
-	if (mount("", "./syz-tmp", "tmpfs", 0, NULL))
-		fail("mount(tmpfs) failed");
-	if (mkdir("./syz-tmp/newroot", 0777))
-		fail("mkdir failed");
-	if (mkdir("./syz-tmp/newroot/dev", 0700))
-		fail("mkdir failed");
-	unsigned mount_flags = MS_BIND | MS_REC | MS_PRIVATE;
-	if (mount("/dev", "./syz-tmp/newroot/dev", NULL, mount_flags, NULL))
-		fail("mount(dev) failed");
-	if (mkdir("./syz-tmp/newroot/proc", 0700))
-		fail("mkdir failed");
-	if (mount(NULL, "./syz-tmp/newroot/proc", "proc", 0, NULL))
-		fail("mount(proc) failed");
-	if (mkdir("./syz-tmp/newroot/selinux", 0700))
-		fail("mkdir failed");
-	// selinux mount used to be at /selinux, but then moved to /sys/fs/selinux.
-	const char* selinux_path = "./syz-tmp/newroot/selinux";
-	if (mount("/selinux", selinux_path, NULL, mount_flags, NULL)) {
-		if (errno != ENOENT)
-			fail("mount(/selinux) failed");
-		if (mount("/sys/fs/selinux", selinux_path, NULL, mount_flags, NULL) && errno != ENOENT)
-			fail("mount(/sys/fs/selinux) failed");
-	}
-	if (mkdir("./syz-tmp/pivot", 0777))
-		fail("mkdir failed");
-	if (syscall(SYS_pivot_root, "./syz-tmp", "./syz-tmp/pivot")) {
-		debug("pivot_root failed\n");
-		if (chdir("./syz-tmp"))
-			fail("chdir failed");
-	} else {
-		debug("pivot_root OK\n");
-		if (chdir("/"))
-			fail("chdir failed");
-		if (umount2("./pivot", MNT_DETACH))
-			fail("umount failed");
-	}
-	if (chroot("./newroot"))
-		fail("chroot failed");
-	if (chdir("/"))
-		fail("chdir failed");
-
-	// Drop CAP_SYS_PTRACE so that test processes can't attach to parent processes.
-	// Previously it lead to hangs because the loop process stopped due to SIGSTOP.
-	// Note that a process can always ptrace its direct children, which is enough
-	// for testing purposes.
-	struct __user_cap_header_struct cap_hdr = {};
-	struct __user_cap_data_struct cap_data[2] = {};
-	cap_hdr.version = _LINUX_CAPABILITY_VERSION_3;
-	cap_hdr.pid = getpid();
-	if (syscall(SYS_capget, &cap_hdr, &cap_data))
-		fail("capget failed");
-	cap_data[0].effective &= ~(1 << CAP_SYS_PTRACE);
-	cap_data[0].permitted &= ~(1 << CAP_SYS_PTRACE);
-	cap_data[0].inheritable &= ~(1 << CAP_SYS_PTRACE);
-	if (syscall(SYS_capset, &cap_hdr, &cap_data))
-		fail("capset failed");
-
-	loop();
-	doexit(1);
-}
-
-static int do_sandbox_namespace(void)
-{
-	int pid;
-
-	real_uid = getuid();
-	real_gid = getgid();
-	mprotect(sandbox_stack, 4096, PROT_NONE); // to catch stack underflows
-	pid = clone(namespace_sandbox_proc, &sandbox_stack[sizeof(sandbox_stack) - 64],
-		    CLONE_NEWUSER | CLONE_NEWPID, 0);
-	if (pid < 0)
-		fail("sandbox clone failed");
-	return pid;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_RESET_NET_NAMESPACE)
 // checkpoint/reset_net_namespace partially resets net namespace to initial state
 // after each test. Currently it resets only ipv4 netfilter state.
 // Ideally, we just create a new net namespace for each test,
@@ -1110,8 +1332,14 @@ static void checkpoint_iptables(struct ipt_table_desc* tables, int num_tables, i
 	int fd, i;
 
 	fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(%d, SOCK_STREAM, IPPROTO_TCP)", family);
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("iptable checkpoint %d: socket failed", family);
+	}
 	for (i = 0; i < num_tables; i++) {
 		struct ipt_table_desc* table = &tables[i];
 		strcpy(table->info.name, table->name);
@@ -1124,19 +1352,24 @@ static void checkpoint_iptables(struct ipt_table_desc* tables, int num_tables, i
 			case ENOPROTOOPT:
 				continue;
 			}
-			fail("getsockopt(IPT_SO_GET_INFO)");
+			fail("iptable checkpoint %s/%d: getsockopt(IPT_SO_GET_INFO)", table->name, family);
 		}
-		debug("checkpoint iptable %s/%d: entries=%d hooks=%x size=%d\n", table->name, family, table->info.num_entries, table->info.valid_hooks, table->info.size);
+		debug("iptable checkpoint %s/%d: checkpoint entries=%d hooks=%x size=%d\n",
+		      table->name, family, table->info.num_entries,
+		      table->info.valid_hooks, table->info.size);
 		if (table->info.size > sizeof(table->replace.entrytable))
-			fail("table size is too large: %u", table->info.size);
+			fail("iptable checkpoint %s/%d: table size is too large: %u",
+			     table->name, family, table->info.size);
 		if (table->info.num_entries > XT_MAX_ENTRIES)
-			fail("too many counters: %u", table->info.num_entries);
+			fail("iptable checkpoint %s/%d: too many counters: %u",
+			     table->name, family, table->info.num_entries);
 		memset(&entries, 0, sizeof(entries));
 		strcpy(entries.name, table->name);
 		entries.size = table->info.size;
 		optlen = sizeof(entries) - sizeof(entries.entrytable) + table->info.size;
 		if (getsockopt(fd, level, IPT_SO_GET_ENTRIES, &entries, &optlen))
-			fail("getsockopt(IPT_SO_GET_ENTRIES)");
+			fail("iptable checkpoint %s/%d: getsockopt(IPT_SO_GET_ENTRIES)",
+			     table->name, family);
 		table->replace.valid_hooks = table->info.valid_hooks;
 		table->replace.num_entries = table->info.num_entries;
 		table->replace.size = table->info.size;
@@ -1156,8 +1389,14 @@ static void reset_iptables(struct ipt_table_desc* tables, int num_tables, int fa
 	int fd, i;
 
 	fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(%d, SOCK_STREAM, IPPROTO_TCP)", family);
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("iptable %d: socket failed", family);
+	}
 	for (i = 0; i < num_tables; i++) {
 		struct ipt_table_desc* table = &tables[i];
 		if (table->info.valid_hooks == 0)
@@ -1166,23 +1405,23 @@ static void reset_iptables(struct ipt_table_desc* tables, int num_tables, int fa
 		strcpy(info.name, table->name);
 		optlen = sizeof(info);
 		if (getsockopt(fd, level, IPT_SO_GET_INFO, &info, &optlen))
-			fail("getsockopt(IPT_SO_GET_INFO)");
+			fail("iptable %s/%d: getsockopt(IPT_SO_GET_INFO)", table->name, family);
 		if (memcmp(&table->info, &info, sizeof(table->info)) == 0) {
 			memset(&entries, 0, sizeof(entries));
 			strcpy(entries.name, table->name);
 			entries.size = table->info.size;
 			optlen = sizeof(entries) - sizeof(entries.entrytable) + entries.size;
 			if (getsockopt(fd, level, IPT_SO_GET_ENTRIES, &entries, &optlen))
-				fail("getsockopt(IPT_SO_GET_ENTRIES)");
+				fail("iptable %s/%d: getsockopt(IPT_SO_GET_ENTRIES)", table->name, family);
 			if (memcmp(table->replace.entrytable, entries.entrytable, table->info.size) == 0)
 				continue;
 		}
-		debug("resetting iptable %s\n", table->name);
+		debug("iptable %s/%d: resetting\n", table->name, family);
 		table->replace.num_counters = info.num_entries;
 		table->replace.counters = counters;
 		optlen = sizeof(table->replace) - sizeof(table->replace.entrytable) + table->replace.size;
 		if (setsockopt(fd, level, IPT_SO_SET_REPLACE, &table->replace, optlen))
-			fail("setsockopt(IPT_SO_SET_REPLACE)");
+			fail("iptable %s/%d: setsockopt(IPT_SO_SET_REPLACE)", table->name, family);
 	}
 	close(fd);
 }
@@ -1195,8 +1434,14 @@ static void checkpoint_arptables(void)
 	int fd;
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("arptable checkpoint: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	}
 	for (i = 0; i < sizeof(arpt_tables) / sizeof(arpt_tables[0]); i++) {
 		struct arpt_table_desc* table = &arpt_tables[i];
 		strcpy(table->info.name, table->name);
@@ -1209,19 +1454,22 @@ static void checkpoint_arptables(void)
 			case ENOPROTOOPT:
 				continue;
 			}
-			fail("getsockopt(ARPT_SO_GET_INFO)");
+			fail("arptable checkpoint %s: getsockopt(ARPT_SO_GET_INFO)", table->name);
 		}
-		debug("checkpoint arptable %s: entries=%d hooks=%x size=%d\n", table->name, table->info.num_entries, table->info.valid_hooks, table->info.size);
+		debug("arptable checkpoint %s: entries=%d hooks=%x size=%d\n",
+		      table->name, table->info.num_entries, table->info.valid_hooks, table->info.size);
 		if (table->info.size > sizeof(table->replace.entrytable))
-			fail("table size is too large: %u", table->info.size);
+			fail("arptable checkpoint %s: table size is too large: %u",
+			     table->name, table->info.size);
 		if (table->info.num_entries > XT_MAX_ENTRIES)
-			fail("too many counters: %u", table->info.num_entries);
+			fail("arptable checkpoint %s: too many counters: %u",
+			     table->name, table->info.num_entries);
 		memset(&entries, 0, sizeof(entries));
 		strcpy(entries.name, table->name);
 		entries.size = table->info.size;
 		optlen = sizeof(entries) - sizeof(entries.entrytable) + table->info.size;
 		if (getsockopt(fd, SOL_IP, ARPT_SO_GET_ENTRIES, &entries, &optlen))
-			fail("getsockopt(ARPT_SO_GET_ENTRIES)");
+			fail("arptable checkpoint %s: getsockopt(ARPT_SO_GET_ENTRIES)", table->name);
 		table->replace.valid_hooks = table->info.valid_hooks;
 		table->replace.num_entries = table->info.num_entries;
 		table->replace.size = table->info.size;
@@ -1242,8 +1490,14 @@ static void reset_arptables()
 	int fd;
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("arptable: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	}
 	for (i = 0; i < sizeof(arpt_tables) / sizeof(arpt_tables[0]); i++) {
 		struct arpt_table_desc* table = &arpt_tables[i];
 		if (table->info.valid_hooks == 0)
@@ -1252,29 +1506,63 @@ static void reset_arptables()
 		strcpy(info.name, table->name);
 		optlen = sizeof(info);
 		if (getsockopt(fd, SOL_IP, ARPT_SO_GET_INFO, &info, &optlen))
-			fail("getsockopt(ARPT_SO_GET_INFO)");
+			fail("arptable %s:getsockopt(ARPT_SO_GET_INFO)", table->name);
 		if (memcmp(&table->info, &info, sizeof(table->info)) == 0) {
 			memset(&entries, 0, sizeof(entries));
 			strcpy(entries.name, table->name);
 			entries.size = table->info.size;
 			optlen = sizeof(entries) - sizeof(entries.entrytable) + entries.size;
 			if (getsockopt(fd, SOL_IP, ARPT_SO_GET_ENTRIES, &entries, &optlen))
-				fail("getsockopt(ARPT_SO_GET_ENTRIES)");
+				fail("arptable %s: getsockopt(ARPT_SO_GET_ENTRIES)", table->name);
 			if (memcmp(table->replace.entrytable, entries.entrytable, table->info.size) == 0)
 				continue;
+			debug("arptable %s: data changed\n", table->name);
+		} else {
+			debug("arptable %s: header changed\n", table->name);
 		}
-		debug("resetting arptable %s\n", table->name);
+		debug("arptable %s: resetting\n", table->name);
 		table->replace.num_counters = info.num_entries;
 		table->replace.counters = counters;
 		optlen = sizeof(table->replace) - sizeof(table->replace.entrytable) + table->replace.size;
 		if (setsockopt(fd, SOL_IP, ARPT_SO_SET_REPLACE, &table->replace, optlen))
-			fail("setsockopt(ARPT_SO_SET_REPLACE)");
+			fail("arptable %s: setsockopt(ARPT_SO_SET_REPLACE)", table->name);
 	}
 	close(fd);
 }
 
-#include <linux/if.h>
-#include <linux/netfilter_bridge/ebtables.h>
+// ebtables.h is broken too:
+// ebtables.h: In function ‘ebt_entry_target* ebt_get_target(ebt_entry*)’:
+// ebtables.h:197:19: error: invalid conversion from ‘void*’ to ‘ebt_entry_target*’
+
+#define NF_BR_NUMHOOKS 6
+#define EBT_TABLE_MAXNAMELEN 32
+#define EBT_CHAIN_MAXNAMELEN 32
+#define EBT_BASE_CTL 128
+#define EBT_SO_SET_ENTRIES (EBT_BASE_CTL)
+#define EBT_SO_GET_INFO (EBT_BASE_CTL)
+#define EBT_SO_GET_ENTRIES (EBT_SO_GET_INFO + 1)
+#define EBT_SO_GET_INIT_INFO (EBT_SO_GET_ENTRIES + 1)
+#define EBT_SO_GET_INIT_ENTRIES (EBT_SO_GET_INIT_INFO + 1)
+
+struct ebt_replace {
+	char name[EBT_TABLE_MAXNAMELEN];
+	unsigned int valid_hooks;
+	unsigned int nentries;
+	unsigned int entries_size;
+	struct ebt_entries* hook_entry[NF_BR_NUMHOOKS];
+	unsigned int num_counters;
+	struct ebt_counter* counters;
+	char* entries;
+};
+
+struct ebt_entries {
+	unsigned int distinguisher;
+	char name[EBT_CHAIN_MAXNAMELEN];
+	unsigned int counter_offset;
+	int policy;
+	unsigned int nentries;
+	char data[0] __attribute__((aligned(__alignof__(struct ebt_replace))));
+};
 
 struct ebt_table_desc {
 	const char* name;
@@ -1295,8 +1583,14 @@ static void checkpoint_ebtables(void)
 	int fd;
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("ebtable checkpoint: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	}
 	for (i = 0; i < sizeof(ebt_tables) / sizeof(ebt_tables[0]); i++) {
 		struct ebt_table_desc* table = &ebt_tables[i];
 		strcpy(table->replace.name, table->name);
@@ -1308,16 +1602,19 @@ static void checkpoint_ebtables(void)
 			case ENOPROTOOPT:
 				continue;
 			}
-			fail("getsockopt(EBT_SO_GET_INIT_INFO)");
+			fail("ebtable checkpoint %s: getsockopt(EBT_SO_GET_INIT_INFO)", table->name);
 		}
-		debug("checkpoint ebtable %s: entries=%d hooks=%x size=%d\n", table->name, table->replace.nentries, table->replace.valid_hooks, table->replace.entries_size);
+		debug("ebtable checkpoint %s: entries=%d hooks=%x size=%d\n",
+		      table->name, table->replace.nentries, table->replace.valid_hooks,
+		      table->replace.entries_size);
 		if (table->replace.entries_size > sizeof(table->entrytable))
-			fail("table size is too large: %u", table->replace.entries_size);
+			fail("ebtable checkpoint %s: table size is too large: %u",
+			     table->name, table->replace.entries_size);
 		table->replace.num_counters = 0;
 		table->replace.entries = table->entrytable;
 		optlen = sizeof(table->replace) + table->replace.entries_size;
 		if (getsockopt(fd, SOL_IP, EBT_SO_GET_INIT_ENTRIES, &table->replace, &optlen))
-			fail("getsockopt(EBT_SO_GET_INIT_ENTRIES)");
+			fail("ebtable checkpoint %s: getsockopt(EBT_SO_GET_INIT_ENTRIES)", table->name);
 	}
 	close(fd);
 }
@@ -1331,8 +1628,14 @@ static void reset_ebtables()
 	int fd;
 
 	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (fd == -1)
-		fail("socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	if (fd == -1) {
+		switch (errno) {
+		case EAFNOSUPPORT:
+		case ENOPROTOOPT:
+			return;
+		}
+		fail("ebtable: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)");
+	}
 	for (i = 0; i < sizeof(ebt_tables) / sizeof(ebt_tables[0]); i++) {
 		struct ebt_table_desc* table = &ebt_tables[i];
 		if (table->replace.valid_hooks == 0)
@@ -1341,8 +1644,9 @@ static void reset_ebtables()
 		strcpy(replace.name, table->name);
 		optlen = sizeof(replace);
 		if (getsockopt(fd, SOL_IP, EBT_SO_GET_INFO, &replace, &optlen))
-			fail("getsockopt(EBT_SO_GET_INFO)");
+			fail("ebtable %s: getsockopt(EBT_SO_GET_INFO)", table->name);
 		replace.num_counters = 0;
+		table->replace.entries = 0;
 		for (h = 0; h < NF_BR_NUMHOOKS; h++)
 			table->replace.hook_entry[h] = 0;
 		if (memcmp(&table->replace, &replace, sizeof(table->replace)) == 0) {
@@ -1350,11 +1654,11 @@ static void reset_ebtables()
 			replace.entries = entrytable;
 			optlen = sizeof(replace) + replace.entries_size;
 			if (getsockopt(fd, SOL_IP, EBT_SO_GET_ENTRIES, &replace, &optlen))
-				fail("getsockopt(EBT_SO_GET_ENTRIES)");
+				fail("ebtable %s: getsockopt(EBT_SO_GET_ENTRIES)", table->name);
 			if (memcmp(table->entrytable, entrytable, replace.entries_size) == 0)
 				continue;
 		}
-		debug("resetting ebtable %s\n", table->name);
+		debug("ebtable %s: resetting\n", table->name);
 		// Kernel does not seem to return actual entry points (wat?).
 		for (j = 0, h = 0; h < NF_BR_NUMHOOKS; h++) {
 			if (table->replace.valid_hooks & (1 << h)) {
@@ -1362,15 +1666,22 @@ static void reset_ebtables()
 				j++;
 			}
 		}
+		table->replace.entries = table->entrytable;
 		optlen = sizeof(table->replace) + table->replace.entries_size;
 		if (setsockopt(fd, SOL_IP, EBT_SO_SET_ENTRIES, &table->replace, optlen))
-			fail("setsockopt(EBT_SO_SET_ENTRIES)");
+			fail("ebtable %s: setsockopt(EBT_SO_SET_ENTRIES)", table->name);
 	}
 	close(fd);
 }
 
 static void checkpoint_net_namespace(void)
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_net_reset)
+		return;
+	if (flag_sandbox == sandbox_setuid)
+		return;
+#endif
 	checkpoint_ebtables();
 	checkpoint_arptables();
 	checkpoint_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
@@ -1379,6 +1690,12 @@ static void checkpoint_net_namespace(void)
 
 static void reset_net_namespace(void)
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_net_reset)
+		return;
+	if (flag_sandbox == sandbox_setuid)
+		return;
+#endif
 	reset_ebtables();
 	reset_arptables();
 	reset_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
@@ -1386,7 +1703,649 @@ static void reset_net_namespace(void)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_USE_TMP_DIR))
+#if SYZ_EXECUTOR || (SYZ_ENABLE_CGROUPS && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP))
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static void setup_cgroups()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	if (mkdir("/syzcgroup", 0777)) {
+		debug("mkdir(/syzcgroup) failed: %d\n", errno);
+	}
+	if (mkdir("/syzcgroup/unified", 0777)) {
+		debug("mkdir(/syzcgroup/unified) failed: %d\n", errno);
+	}
+	if (mount("none", "/syzcgroup/unified", "cgroup2", 0, NULL)) {
+		debug("mount(cgroup2) failed: %d\n", errno);
+	}
+	if (chmod("/syzcgroup/unified", 0777)) {
+		debug("chmod(/syzcgroup/unified) failed: %d\n", errno);
+	}
+	write_file("/syzcgroup/unified/cgroup.subtree_control", "+cpu +memory +io +pids +rdma");
+	if (mkdir("/syzcgroup/cpu", 0777)) {
+		debug("mkdir(/syzcgroup/cpu) failed: %d\n", errno);
+	}
+	if (mount("none", "/syzcgroup/cpu", "cgroup", 0, "cpuset,cpuacct,perf_event,hugetlb")) {
+		debug("mount(cgroup cpu) failed: %d\n", errno);
+	}
+	write_file("/syzcgroup/cpu/cgroup.clone_children", "1");
+	if (chmod("/syzcgroup/cpu", 0777)) {
+		debug("chmod(/syzcgroup/cpu) failed: %d\n", errno);
+	}
+	if (mkdir("/syzcgroup/net", 0777)) {
+		debug("mkdir(/syzcgroup/net) failed: %d\n", errno);
+	}
+	if (mount("none", "/syzcgroup/net", "cgroup", 0, "net_cls,net_prio,devices,freezer")) {
+		debug("mount(cgroup net) failed: %d\n", errno);
+	}
+	if (chmod("/syzcgroup/net", 0777)) {
+		debug("chmod(/syzcgroup/net) failed: %d\n", errno);
+	}
+}
+
+#if SYZ_EXECUTOR || SYZ_REPEAT
+static void setup_cgroups_loop()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	int pid = getpid();
+	char file[128];
+	char cgroupdir[64];
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	// Restrict number of pids per test process to prevent fork bombs.
+	// We have up to 16 threads + main process + loop.
+	// 32 pids should be enough for everyone.
+	snprintf(file, sizeof(file), "%s/pids.max", cgroupdir);
+	write_file(file, "32");
+	// Restrict memory consumption.
+	// We have some syscalls that inherently consume lots of memory,
+	// e.g. mounting some filesystem images requires at least 128MB
+	// image in memory. We restrict RLIMIT_AS to 200MB. Here we gradually
+	// increase low/high/max limits to make things more interesting.
+	// Also this takes into account KASAN quarantine size.
+	// If the limit is lower than KASAN quarantine size, then it can happen
+	// so that we kill the process, but all of its memory is in quarantine
+	// and is still accounted against memcg. As the result memcg won't
+	// allow to allocate any memory in the parent and in the new test process.
+	// The current limit of 300MB supports up to 9.6GB RAM (quarantine is 1/32).
+	snprintf(file, sizeof(file), "%s/memory.low", cgroupdir);
+	write_file(file, "%d", 298 << 20);
+	snprintf(file, sizeof(file), "%s/memory.high", cgroupdir);
+	write_file(file, "%d", 299 << 20);
+	snprintf(file, sizeof(file), "%s/memory.max", cgroupdir);
+	write_file(file, "%d", 300 << 20);
+	// Setup some v1 groups to make things more interesting.
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
+	if (mkdir(cgroupdir, 0777)) {
+		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+	write_file(file, "%d", pid);
+}
+
+static void setup_cgroups_test()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	char cgroupdir[64];
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/unified/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup")) {
+		debug("symlink(%s, ./cgroup) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup.cpu")) {
+		debug("symlink(%s, ./cgroup.cpu) failed: %d\n", cgroupdir, errno);
+	}
+	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/net/syz%llu", procid);
+	if (symlink(cgroupdir, "./cgroup.net")) {
+		debug("symlink(%s, ./cgroup.net) failed: %d\n", cgroupdir, errno);
+	}
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NAMESPACE
+void initialize_cgroups()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_cgroups)
+		return;
+#endif
+	if (mkdir("./syz-tmp/newroot/syzcgroup", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/unified", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/cpu", 0700))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/syzcgroup/net", 0700))
+		fail("mkdir failed");
+	unsigned bind_mount_flags = MS_BIND | MS_REC | MS_PRIVATE;
+	if (mount("/syzcgroup/unified", "./syz-tmp/newroot/syzcgroup/unified", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup2, MS_BIND) failed: %d\n", errno);
+	}
+	if (mount("/syzcgroup/cpu", "./syz-tmp/newroot/syzcgroup/cpu", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup/cpu, MS_BIND) failed: %d\n", errno);
+	}
+	if (mount("/syzcgroup/net", "./syz-tmp/newroot/syzcgroup/net", NULL, bind_mount_flags, NULL)) {
+		debug("mount(cgroup/net, MS_BIND) failed: %d\n", errno);
+	}
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || (SYZ_ENABLE_BINFMT_MISC && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP))
+#include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static void setup_binfmt_misc()
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_binfmt_misc)
+		return;
+#endif
+	if (mount(0, "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, 0)) {
+		debug("mount(binfmt_misc) failed: %d\n", errno);
+	}
+	write_file("/proc/sys/fs/binfmt_misc/register", ":syz0:M:0:\x01::./file0:");
+	write_file("/proc/sys/fs/binfmt_misc/register", ":syz1:M:1:\x02::./file0:POC");
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
+#include <errno.h>
+#include <sys/mount.h>
+
+static void setup_common()
+{
+	if (mount(0, "/sys/fs/fuse/connections", "fusectl", 0, 0)) {
+		debug("mount(fusectl) failed: %d\n", errno);
+	}
+#if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
+	setup_cgroups();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_BINFMT_MISC
+	setup_binfmt_misc();
+#endif
+}
+
+#include <sched.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+
+static void loop();
+
+static void sandbox_common()
+{
+	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+	setpgrp();
+	setsid();
+
+#if SYZ_EXECUTOR || __NR_syz_init_net_socket
+	int netns = open("/proc/self/ns/net", O_RDONLY);
+	if (netns == -1)
+		fail("open(/proc/self/ns/net) failed");
+	if (dup2(netns, kInitNetNsFd) < 0)
+		fail("dup2(netns, kInitNetNsFd) failed");
+	close(netns);
+#endif
+
+	struct rlimit rlim;
+#if SYZ_EXECUTOR
+	rlim.rlim_cur = rlim.rlim_max = (200 << 20) +
+					(kMaxThreads * kCoverSize + kExtraCoverSize) * sizeof(void*);
+#else
+	rlim.rlim_cur = rlim.rlim_max = (200 << 20);
+#endif
+	setrlimit(RLIMIT_AS, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 32 << 20;
+	setrlimit(RLIMIT_MEMLOCK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 136 << 20;
+	setrlimit(RLIMIT_FSIZE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_STACK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 0;
+	setrlimit(RLIMIT_CORE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 256; // see kMaxFd
+	setrlimit(RLIMIT_NOFILE, &rlim);
+
+	// CLONE_NEWNS/NEWCGROUP cause EINVAL on some systems,
+	// so we do them separately of clone in do_sandbox_namespace.
+	if (unshare(CLONE_NEWNS)) {
+		debug("unshare(CLONE_NEWNS): %d\n", errno);
+	}
+	if (unshare(CLONE_NEWIPC)) {
+		debug("unshare(CLONE_NEWIPC): %d\n", errno);
+	}
+	if (unshare(0x02000000)) {
+		debug("unshare(CLONE_NEWCGROUP): %d\n", errno);
+	}
+	if (unshare(CLONE_NEWUTS)) {
+		debug("unshare(CLONE_NEWUTS): %d\n", errno);
+	}
+	if (unshare(CLONE_SYSVSEM)) {
+		debug("unshare(CLONE_SYSVSEM): %d\n", errno);
+	}
+	// These sysctl's restrict ipc resource usage (by default it's possible
+	// to eat all system memory by creating e.g. lots of large sem sets).
+	// These sysctl's are per-namespace, so we need to set them inside
+	// of the test ipc namespace (after CLONE_NEWIPC).
+	typedef struct {
+		const char* name;
+		const char* value;
+	} sysctl_t;
+	static const sysctl_t sysctls[] = {
+	    {"/proc/sys/kernel/shmmax", "16777216"},
+	    {"/proc/sys/kernel/shmall", "536870912"},
+	    {"/proc/sys/kernel/shmmni", "1024"},
+	    {"/proc/sys/kernel/msgmax", "8192"},
+	    {"/proc/sys/kernel/msgmni", "1024"},
+	    {"/proc/sys/kernel/msgmnb", "1024"},
+	    {"/proc/sys/kernel/sem", "1024 1048576 500 1024"},
+	};
+	unsigned i;
+	for (i = 0; i < sizeof(sysctls) / sizeof(sysctls[0]); i++)
+		write_file(sysctls[i].name, sysctls[i].value);
+}
+
+int wait_for_loop(int pid)
+{
+	if (pid < 0)
+		fail("sandbox fork failed");
+	debug("spawned loop pid %d\n", pid);
+	int status = 0;
+	while (waitpid(-1, &status, __WALL) != pid) {
+	}
+	return WEXITSTATUS(status);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
+#include <sched.h>
+#include <sys/types.h>
+
+static int do_sandbox_none(void)
+{
+	// CLONE_NEWPID takes effect for the first child of the current process,
+	// so we do it before fork to make the loop "init" process of the namespace.
+	// We ought to do fail here, but sandbox=none is used in pkg/ipc tests
+	// and they are usually run under non-root.
+	// Also since debug is stripped by pkg/csource, we need to do {}
+	// even though we generally don't do {} around single statements.
+	if (unshare(CLONE_NEWPID)) {
+		debug("unshare(CLONE_NEWPID): %d\n", errno);
+	}
+	int pid = fork();
+	if (pid != 0)
+		return wait_for_loop(pid);
+
+	setup_common();
+	sandbox_common();
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices_init();
+#endif
+	if (unshare(CLONE_NEWNET)) {
+		debug("unshare(CLONE_NEWNET): %d\n", errno);
+	}
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+	initialize_tun();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices();
+#endif
+	loop();
+	doexit(1);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID
+#include <grp.h>
+#include <sched.h>
+#include <sys/prctl.h>
+
+#define SYZ_HAVE_SANDBOX_SETUID 1
+static int do_sandbox_setuid(void)
+{
+	if (unshare(CLONE_NEWPID)) {
+		debug("unshare(CLONE_NEWPID): %d\n", errno);
+	}
+	int pid = fork();
+	if (pid != 0)
+		return wait_for_loop(pid);
+
+	setup_common();
+	sandbox_common();
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices_init();
+#endif
+	if (unshare(CLONE_NEWNET)) {
+		debug("unshare(CLONE_NEWNET): %d\n", errno);
+	}
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+	initialize_tun();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices();
+#endif
+
+	const int nobody = 65534;
+	if (setgroups(0, NULL))
+		fail("failed to setgroups");
+	if (syscall(SYS_setresgid, nobody, nobody, nobody))
+		fail("failed to setresgid");
+	if (syscall(SYS_setresuid, nobody, nobody, nobody))
+		fail("failed to setresuid");
+
+	// This is required to open /proc/self/* files.
+	// Otherwise they are owned by root and we can't open them after setuid.
+	// See task_dump_owner function in kernel.
+	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+
+	loop();
+	doexit(1);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NAMESPACE
+#include <linux/capability.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+
+static int real_uid;
+static int real_gid;
+__attribute__((aligned(64 << 10))) static char sandbox_stack[1 << 20];
+
+static int namespace_sandbox_proc(void* arg)
+{
+	sandbox_common();
+
+	// /proc/self/setgroups is not present on some systems, ignore error.
+	write_file("/proc/self/setgroups", "deny");
+	if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid))
+		fail("write of /proc/self/uid_map failed");
+	if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid))
+		fail("write of /proc/self/gid_map failed");
+
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices_init();
+#endif
+	// CLONE_NEWNET must always happen before tun setup,
+	// because we want the tun device in the test namespace.
+	if (unshare(CLONE_NEWNET))
+		fail("unshare(CLONE_NEWNET)");
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+	// We setup tun here as it needs to be in the test net namespace,
+	// which in turn needs to be in the test user namespace.
+	// However, IFF_NAPI_FRAGS will fail as we are not root already.
+	// TODO: we should create tun in the init net namespace and use setns
+	// to move it to the target namespace.
+	initialize_tun();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	initialize_netdevices();
+#endif
+
+	if (mkdir("./syz-tmp", 0777))
+		fail("mkdir(syz-tmp) failed");
+	if (mount("", "./syz-tmp", "tmpfs", 0, NULL))
+		fail("mount(tmpfs) failed");
+	if (mkdir("./syz-tmp/newroot", 0777))
+		fail("mkdir failed");
+	if (mkdir("./syz-tmp/newroot/dev", 0700))
+		fail("mkdir failed");
+	unsigned bind_mount_flags = MS_BIND | MS_REC | MS_PRIVATE;
+	if (mount("/dev", "./syz-tmp/newroot/dev", NULL, bind_mount_flags, NULL))
+		fail("mount(dev) failed");
+	if (mkdir("./syz-tmp/newroot/proc", 0700))
+		fail("mkdir failed");
+	if (mount(NULL, "./syz-tmp/newroot/proc", "proc", 0, NULL))
+		fail("mount(proc) failed");
+	if (mkdir("./syz-tmp/newroot/selinux", 0700))
+		fail("mkdir failed");
+	// selinux mount used to be at /selinux, but then moved to /sys/fs/selinux.
+	const char* selinux_path = "./syz-tmp/newroot/selinux";
+	if (mount("/selinux", selinux_path, NULL, bind_mount_flags, NULL)) {
+		if (errno != ENOENT)
+			fail("mount(/selinux) failed");
+		if (mount("/sys/fs/selinux", selinux_path, NULL, bind_mount_flags, NULL) && errno != ENOENT)
+			fail("mount(/sys/fs/selinux) failed");
+	}
+	if (mkdir("./syz-tmp/newroot/sys", 0700))
+		fail("mkdir failed");
+	if (mount("/sys", "./syz-tmp/newroot/sys", 0, bind_mount_flags, NULL))
+		fail("mount(sysfs) failed");
+#if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
+	initialize_cgroups();
+#endif
+	if (mkdir("./syz-tmp/pivot", 0777))
+		fail("mkdir failed");
+	if (syscall(SYS_pivot_root, "./syz-tmp", "./syz-tmp/pivot")) {
+		debug("pivot_root failed\n");
+		if (chdir("./syz-tmp"))
+			fail("chdir failed");
+	} else {
+		debug("pivot_root OK\n");
+		if (chdir("/"))
+			fail("chdir failed");
+		if (umount2("./pivot", MNT_DETACH))
+			fail("umount failed");
+	}
+	if (chroot("./newroot"))
+		fail("chroot failed");
+	if (chdir("/"))
+		fail("chdir failed");
+
+	// Drop CAP_SYS_PTRACE so that test processes can't attach to parent processes.
+	// Previously it lead to hangs because the loop process stopped due to SIGSTOP.
+	// Note that a process can always ptrace its direct children, which is enough
+	// for testing purposes.
+	struct __user_cap_header_struct cap_hdr = {};
+	struct __user_cap_data_struct cap_data[2] = {};
+	cap_hdr.version = _LINUX_CAPABILITY_VERSION_3;
+	cap_hdr.pid = getpid();
+	if (syscall(SYS_capget, &cap_hdr, &cap_data))
+		fail("capget failed");
+	cap_data[0].effective &= ~(1 << CAP_SYS_PTRACE);
+	cap_data[0].permitted &= ~(1 << CAP_SYS_PTRACE);
+	cap_data[0].inheritable &= ~(1 << CAP_SYS_PTRACE);
+	if (syscall(SYS_capset, &cap_hdr, &cap_data))
+		fail("capset failed");
+
+	loop();
+	doexit(1);
+}
+
+#define SYZ_HAVE_SANDBOX_NAMESPACE 1
+static int do_sandbox_namespace(void)
+{
+	int pid;
+
+	setup_common();
+	real_uid = getuid();
+	real_gid = getgid();
+	mprotect(sandbox_stack, 4096, PROT_NONE); // to catch stack underflows
+	pid = clone(namespace_sandbox_proc, &sandbox_stack[sizeof(sandbox_stack) - 64],
+		    CLONE_NEWUSER | CLONE_NEWPID, 0);
+	return wait_for_loop(pid);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_ANDROID_UNTRUSTED_APP
+#include <fcntl.h> // open(2)
+#include <grp.h> // setgroups
+#include <sys/xattr.h> // setxattr, getxattr
+
+#define AID_NET_BT_ADMIN 3001
+#define AID_NET_BT 3002
+#define AID_INET 3003
+#define AID_EVERYBODY 9997
+#define AID_APP 10000
+
+#define UNTRUSTED_APP_UID AID_APP + 999
+#define UNTRUSTED_APP_GID AID_APP + 999
+
+const char* SELINUX_CONTEXT_UNTRUSTED_APP = "u:r:untrusted_app:s0:c512,c768";
+const char* SELINUX_LABEL_APP_DATA_FILE = "u:object_r:app_data_file:s0:c512,c768";
+const char* SELINUX_CONTEXT_FILE = "/proc/thread-self/attr/current";
+const char* SELINUX_XATTR_NAME = "security.selinux";
+
+const gid_t UNTRUSTED_APP_GROUPS[] = {UNTRUSTED_APP_GID, AID_NET_BT_ADMIN, AID_NET_BT, AID_INET, AID_EVERYBODY};
+const size_t UNTRUSTED_APP_NUM_GROUPS = sizeof(UNTRUSTED_APP_GROUPS) / sizeof(UNTRUSTED_APP_GROUPS[0]);
+
+// Similar to libselinux getcon(3), but:
+// - No library dependency
+// - No dynamic memory allocation
+// - Uses fail() instead of returning an error code
+static void syz_getcon(char* context, size_t context_size)
+{
+	int fd = open(SELINUX_CONTEXT_FILE, O_RDONLY);
+
+	if (fd < 0)
+		fail("getcon: Couldn't open %s", SELINUX_CONTEXT_FILE);
+
+	ssize_t nread = read(fd, context, context_size);
+
+	close(fd);
+
+	if (nread <= 0)
+		fail("getcon: Failed to read from %s", SELINUX_CONTEXT_FILE);
+
+	// The contents of the context file MAY end with a newline
+	// and MAY not have a null terminator.  Handle this here.
+	if (context[nread - 1] == '\n')
+		context[nread - 1] = '\0';
+}
+
+// Similar to libselinux setcon(3), but:
+// - No library dependency
+// - No dynamic memory allocation
+// - Uses fail() instead of returning an error code
+static void syz_setcon(const char* context)
+{
+	char new_context[512];
+
+	// Attempt to write the new context
+	int fd = open(SELINUX_CONTEXT_FILE, O_WRONLY);
+
+	if (fd < 0)
+		fail("setcon: Could not open %s", SELINUX_CONTEXT_FILE);
+
+	ssize_t bytes_written = write(fd, context, strlen(context));
+
+	// N.B.: We cannot reuse this file descriptor, since the target SELinux context
+	//       may not be able to read from it.
+	close(fd);
+
+	if (bytes_written != (ssize_t)strlen(context))
+		fail("setcon: Could not write entire context.  Wrote %zi, expected %zu", bytes_written, strlen(context));
+
+	// Validate the transition by checking the context
+	syz_getcon(new_context, sizeof(new_context));
+
+	if (strcmp(context, new_context) != 0)
+		fail("setcon: Failed to change to %s, context is %s", context, new_context);
+}
+
+// Similar to libselinux getfilecon(3), but:
+// - No library dependency
+// - No dynamic memory allocation
+// - Uses fail() instead of returning an error code
+static int syz_getfilecon(const char* path, char* context, size_t context_size)
+{
+	int length = getxattr(path, SELINUX_XATTR_NAME, context, context_size);
+
+	if (length == -1)
+		fail("getfilecon: getxattr failed");
+
+	return length;
+}
+
+// Similar to libselinux setfilecon(3), but:
+// - No library dependency
+// - No dynamic memory allocation
+// - Uses fail() instead of returning an error code
+static void syz_setfilecon(const char* path, const char* context)
+{
+	char new_context[512];
+
+	if (setxattr(path, SELINUX_XATTR_NAME, context, strlen(context) + 1, 0) != 0)
+		fail("setfilecon: setxattr failed");
+
+	if (syz_getfilecon(path, new_context, sizeof(new_context)) <= 0)
+		fail("setfilecon: getfilecon failed");
+
+	if (strcmp(context, new_context) != 0)
+		fail("setfilecon: could not set context to %s, currently %s", context, new_context);
+}
+
+#define SYZ_HAVE_SANDBOX_ANDROID_UNTRUSTED_APP 1
+static int do_sandbox_android_untrusted_app(void)
+{
+	setup_common();
+	sandbox_common();
+
+	if (chown(".", UNTRUSTED_APP_UID, UNTRUSTED_APP_UID) != 0)
+		fail("chmod failed");
+
+	if (setgroups(UNTRUSTED_APP_NUM_GROUPS, UNTRUSTED_APP_GROUPS) != 0)
+		fail("setgroups failed");
+
+	if (setresgid(UNTRUSTED_APP_GID, UNTRUSTED_APP_GID, UNTRUSTED_APP_GID) != 0)
+		fail("setresgid failed");
+
+	if (setresuid(UNTRUSTED_APP_UID, UNTRUSTED_APP_UID, UNTRUSTED_APP_UID) != 0)
+		fail("setresuid failed");
+
+	syz_setfilecon(".", SELINUX_LABEL_APP_DATA_FILE);
+	syz_setcon(SELINUX_CONTEXT_UNTRUSTED_APP);
+
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+	initialize_tun();
+#endif
+#if SYZ_EXECUTOR || SYZ_ENABLE_NETDEV
+	// Note: sandbox_android_untrusted_app does not unshare net namespace.
+	initialize_netdevices_init();
+	initialize_netdevices();
+#endif
+
+	loop();
+	doexit(1);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_REPEAT && SYZ_USE_TMP_DIR
+#include <dirent.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+
+#define FS_IOC_SETFLAGS _IOW('f', 2, long)
+
 // One does not simply remove a directory.
 // There can be mounts, so we need to try to umount.
 // Moreover, a mount can be mounted several times, so we need to try to umount in a loop.
@@ -1398,6 +2357,9 @@ static void remove_dir(const char* dir)
 	struct dirent* ep;
 	int iter = 0;
 retry:
+	while (umount2(dir, MNT_DETACH) == 0) {
+		debug("umount(%s)\n", dir);
+	}
 	dp = opendir(dir);
 	if (dp == NULL) {
 		if (errno == EMFILE) {
@@ -1413,6 +2375,11 @@ retry:
 			continue;
 		char filename[FILENAME_MAX];
 		snprintf(filename, sizeof(filename), "%s/%s", dir, ep->d_name);
+		// If it's 9p mount with broken transport, lstat will fail.
+		// So try to umount first.
+		while (umount2(filename, MNT_DETACH) == 0) {
+			debug("umount(%s)\n", filename);
+		}
 		struct stat st;
 		if (lstat(filename, &st))
 			exitf("lstat(%s) failed", filename);
@@ -1422,9 +2389,19 @@ retry:
 		}
 		int i;
 		for (i = 0;; i++) {
-			debug("unlink(%s)\n", filename);
 			if (unlink(filename) == 0)
 				break;
+			if (errno == EPERM) {
+				// Try to reset FS_XFLAG_IMMUTABLE.
+				int fd = open(filename, O_RDONLY);
+				if (fd != -1) {
+					long flags = 0;
+					if (ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0)
+						debug("reset FS_XFLAG_IMMUTABLE\n");
+					close(fd);
+					continue;
+				}
+			}
 			if (errno == EROFS) {
 				debug("ignoring EROFS\n");
 				break;
@@ -1439,10 +2416,20 @@ retry:
 	closedir(dp);
 	int i;
 	for (i = 0;; i++) {
-		debug("rmdir(%s)\n", dir);
 		if (rmdir(dir) == 0)
 			break;
 		if (i < 100) {
+			if (errno == EPERM) {
+				// Try to reset FS_XFLAG_IMMUTABLE.
+				int fd = open(dir, O_RDONLY);
+				if (fd != -1) {
+					long flags = 0;
+					if (ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0)
+						debug("reset FS_XFLAG_IMMUTABLE\n");
+					close(fd);
+					continue;
+				}
+			}
 			if (errno == EROFS) {
 				debug("ignoring EROFS\n");
 				break;
@@ -1465,18 +2452,26 @@ retry:
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(SYZ_FAULT_INJECTION)
+#if SYZ_EXECUTOR || SYZ_FAULT_INJECTION
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 static int inject_fault(int nth)
 {
+#if SYZ_EXECUTOR
+	if (!flag_enable_fault_injection)
+		return 0;
+#endif
 	int fd;
-	char buf[16];
-
 	fd = open("/proc/thread-self/fail-nth", O_RDWR);
 	// We treat errors here as temporal/non-critical because we see
 	// occasional ENOENT/EACCES errors returned. It seems that fuzzer
 	// somehow gets its hands to it.
 	if (fd == -1)
 		exitf("failed to open /proc/thread-self/fail-nth");
+	char buf[16];
 	sprintf(buf, "%d", nth + 1);
 	if (write(fd, buf, strlen(buf)) != (ssize_t)strlen(buf))
 		exitf("failed to write /proc/thread-self/fail-nth");
@@ -1484,9 +2479,11 @@ static int inject_fault(int nth)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR)
+#if SYZ_EXECUTOR
 static int fault_injected(int fail_fd)
 {
+	if (!flag_enable_fault_injection)
+		return 0;
 	char buf[16];
 	int n = read(fail_fd, buf, sizeof(buf) - 1);
 	if (n <= 0)
@@ -1500,131 +2497,129 @@ static int fault_injected(int fail_fd)
 }
 #endif
 
-#if defined(SYZ_REPEAT)
-static void test();
+#if SYZ_EXECUTOR || SYZ_REPEAT
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
-#if defined(SYZ_WAIT_REPEAT)
-void loop()
+static void kill_and_wait(int pid, int* status)
 {
-	int iter;
-#if defined(SYZ_RESET_NET_NAMESPACE)
+	kill(-pid, SIGKILL);
+	kill(pid, SIGKILL);
+	int i;
+	// First, give it up to 100 ms to surrender.
+	for (i = 0; i < 100; i++) {
+		if (waitpid(-1, status, WNOHANG | __WALL) == pid)
+			return;
+		usleep(1000);
+	}
+	// Now, try to abort fuse connections as they cause deadlocks,
+	// see Documentation/filesystems/fuse.txt for details.
+	// There is no good way to figure out the right connections
+	// provided that the process could use unshare(CLONE_NEWNS),
+	// so we abort all.
+	debug("kill is not working\n");
+	DIR* dir = opendir("/sys/fs/fuse/connections");
+	if (dir) {
+		for (;;) {
+			struct dirent* ent = readdir(dir);
+			if (!ent)
+				break;
+			if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+				continue;
+			char abort[300];
+			snprintf(abort, sizeof(abort), "/sys/fs/fuse/connections/%s/abort", ent->d_name);
+			int fd = open(abort, O_WRONLY);
+			if (fd == -1) {
+				debug("failed to open %s: %d\n", abort, errno);
+				continue;
+			}
+			debug("aborting fuse conn %s\n", ent->d_name);
+			if (write(fd, abort, 1) < 0) {
+				debug("failed to abort: %d\n", errno);
+			}
+			close(fd);
+		}
+		closedir(dir);
+	} else {
+		debug("failed to open /sys/fs/fuse/connections: %d\n", errno);
+	}
+	// Now, just wait, no other options.
+	while (waitpid(-1, status, __WALL) != pid) {
+	}
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_REPEAT && (SYZ_ENABLE_CGROUPS || SYZ_RESET_NET_NAMESPACE)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define SYZ_HAVE_SETUP_LOOP 1
+static void setup_loop()
+{
+#if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
+	setup_cgroups_loop();
+#endif
+#if SYZ_EXECUTOR || SYZ_RESET_NET_NAMESPACE
 	checkpoint_net_namespace();
 #endif
-	for (iter = 0;; iter++) {
-#ifdef SYZ_USE_TMP_DIR
-		char cwdbuf[256];
-		sprintf(cwdbuf, "./%d", iter);
-		if (mkdir(cwdbuf, 0777))
-			fail("failed to mkdir");
-#endif
-		int pid = fork();
-		if (pid < 0)
-			fail("loop fork failed");
-		if (pid == 0) {
-			prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-			setpgrp();
-#ifdef SYZ_USE_TMP_DIR
-			if (chdir(cwdbuf))
-				fail("failed to chdir");
-#endif
-#ifdef SYZ_TUN_ENABLE
-			flush_tun();
-#endif
-			test();
-			doexit(0);
-		}
-		int status = 0;
-		uint64 start = current_time_ms();
-		for (;;) {
-			int res = waitpid(-1, &status, __WALL | WNOHANG);
-			if (res == pid)
-				break;
-			usleep(1000);
-			if (current_time_ms() - start > 5 * 1000) {
-				kill(-pid, SIGKILL);
-				kill(pid, SIGKILL);
-				while (waitpid(-1, &status, __WALL) != pid) {
-				}
-				break;
-			}
-		}
-#ifdef SYZ_USE_TMP_DIR
-		remove_dir(cwdbuf);
-#endif
-#if defined(SYZ_RESET_NET_NAMESPACE)
-		reset_net_namespace();
-#endif
-	}
-}
-#else
-void loop()
-{
-	while (1) {
-		test();
-	}
 }
 #endif
-#endif
 
-#if defined(SYZ_THREADED)
-struct thread_t {
-	int created, running, call;
-	pthread_t th;
-};
-
-static struct thread_t threads[16];
-static void execute_call(int call);
-static int running;
-#if defined(SYZ_COLLIDE)
-static int collide;
-#endif
-
-static void* thr(void* arg)
+#if SYZ_EXECUTOR || SYZ_REPEAT && (SYZ_RESET_NET_NAMESPACE || __NR_syz_mount_image || __NR_syz_read_part_table)
+#define SYZ_HAVE_RESET_LOOP 1
+static void reset_loop()
 {
-	struct thread_t* th = (struct thread_t*)arg;
-	for (;;) {
-		while (!__atomic_load_n(&th->running, __ATOMIC_ACQUIRE))
-			syscall(SYS_futex, &th->running, FUTEX_WAIT, 0, 0);
-		execute_call(th->call);
-		__atomic_fetch_sub(&running, 1, __ATOMIC_RELAXED);
-		__atomic_store_n(&th->running, 0, __ATOMIC_RELEASE);
-		syscall(SYS_futex, &th->running, FUTEX_WAKE);
+#if SYZ_EXECUTOR || __NR_syz_mount_image || __NR_syz_read_part_table
+	char buf[64];
+	snprintf(buf, sizeof(buf), "/dev/loop%llu", procid);
+	int loopfd = open(buf, O_RDWR);
+	if (loopfd != -1) {
+		ioctl(loopfd, LOOP_CLR_FD, 0);
+		close(loopfd);
 	}
-	return 0;
+#endif
+#if SYZ_EXECUTOR || SYZ_RESET_NET_NAMESPACE
+	reset_net_namespace();
+#endif
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_REPEAT
+#include <sys/prctl.h>
+
+#define SYZ_HAVE_SETUP_TEST 1
+static void setup_test()
+{
+	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+	setpgrp();
+#if SYZ_EXECUTOR || SYZ_ENABLE_CGROUPS
+	setup_cgroups_test();
+#endif
+	// It's the leaf test process we want to be always killed first.
+	write_file("/proc/self/oom_score_adj", "1000");
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+	// Read all remaining packets from tun to better
+	// isolate consequently executing programs.
+	flush_tun();
+#endif
 }
 
-static void execute(int num_calls)
+#define SYZ_HAVE_RESET_TEST 1
+static void reset_test()
 {
-	int call, thread;
-	running = 0;
-	for (call = 0; call < num_calls; call++) {
-		for (thread = 0; thread < sizeof(threads) / sizeof(threads[0]); thread++) {
-			struct thread_t* th = &threads[thread];
-			if (!th->created) {
-				th->created = 1;
-				pthread_attr_t attr;
-				pthread_attr_init(&attr);
-				pthread_attr_setstacksize(&attr, 128 << 10);
-				pthread_create(&th->th, &attr, thr, th);
-			}
-			if (!__atomic_load_n(&th->running, __ATOMIC_ACQUIRE)) {
-				th->call = call;
-				__atomic_fetch_add(&running, 1, __ATOMIC_RELAXED);
-				__atomic_store_n(&th->running, 1, __ATOMIC_RELEASE);
-				syscall(SYS_futex, &th->running, FUTEX_WAKE);
-#if defined(SYZ_COLLIDE)
-				if (collide && call % 2)
-					break;
-#endif
-				struct timespec ts;
-				ts.tv_sec = 0;
-				ts.tv_nsec = 20 * 1000 * 1000;
-				syscall(SYS_futex, &th->running, FUTEX_WAIT, 1, &ts);
-				if (running)
-					usleep((call == num_calls - 1) ? 10000 : 1000);
-				break;
-			}
-		}
-	}
+	// Keeping a 9p transport pipe open will hang the proccess dead,
+	// so close all opened file descriptors.
+	int fd;
+	for (fd = 3; fd < 30; fd++)
+		close(fd);
 }
 #endif

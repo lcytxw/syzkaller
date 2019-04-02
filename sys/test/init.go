@@ -5,28 +5,9 @@ package test
 
 import (
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/sys/targets"
 )
 
-func initTarget(target *prog.Target) {
-	arch := &arch{
-		mmapSyscall: target.SyscallMap["mmap"],
-	}
-
-	target.MakeMmap = arch.makeMmap
-}
-
-type arch struct {
-	mmapSyscall *prog.Syscall
-}
-
-func (arch *arch) makeMmap(addr, size uint64) *prog.Call {
-	meta := arch.mmapSyscall
-	return &prog.Call{
-		Meta: meta,
-		Args: []prog.Arg{
-			prog.MakeVmaPointerArg(meta.Args[0], addr, size),
-			prog.MakeConstArg(meta.Args[1], size),
-		},
-		Ret: prog.MakeReturnArg(meta.Ret),
-	}
+func InitTarget(target *prog.Target) {
+	target.MakeMmap = targets.MakeSyzMmap(target)
 }

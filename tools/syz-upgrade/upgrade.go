@@ -24,7 +24,7 @@ import (
 
 func main() {
 	if len(os.Args) != 2 {
-		fatalf("usage: syz-upgrage corpus_dir")
+		fatalf("usage: syz-upgrade corpus_dir")
 	}
 	files, err := ioutil.ReadDir(os.Args[1])
 	if err != nil {
@@ -40,7 +40,7 @@ func main() {
 		if err != nil {
 			fatalf("failed to read program: %v", err)
 		}
-		p, err := target.Deserialize(data)
+		p, err := target.Deserialize(data, prog.NonStrict)
 		if err != nil {
 			fatalf("failed to deserialize program: %v", err)
 		}

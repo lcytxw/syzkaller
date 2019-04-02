@@ -4,159 +4,363 @@
 // This file is shared between executor and csource package.
 
 #include <unistd.h>
-#if defined(SYZ_EXECUTOR) || defined(SYZ_THREADED) || defined(SYZ_COLLIDE)
-#include <pthread.h>
-#include <stdlib.h>
-#endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-#include <errno.h>
-#include <signal.h>
+
+#include <pwd.h>
 #include <stdarg.h>
-#include <stdio.h>
-#include <sys/time.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/syscall.h>
+
+#if GOOS_openbsd
+
+#define __syscall syscall
+
+#if SYZ_EXECUTOR || __NR_syz_open_pts
+
+#include <termios.h>
+#include <util.h>
+
+static uintptr_t syz_open_pts(void)
+{
+	int master, slave;
+
+	if (openpty(&master, &slave, NULL, NULL, NULL) == -1)
+		return -1;
+	// Move the master fd up in order to reduce the chances of the fuzzer
+	// generating a call to close(2) with the same fd.
+	if (dup2(master, master + 100) != -1)
+		close(master);
+	return slave;
+}
+
+#endif // SYZ_EXECUTOR || __NR_syz_open_pts
+
+#endif // GOOS_openbsd
+
+#if GOOS_freebsd || GOOS_openbsd
+
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE
+
+#include <fcntl.h>
+#include <net/if_tun.h>
+#include <sys/types.h>
+
+static int tunfd = -1;
+
+// We just need this to be large enough to hold headers that we parse (ethernet/ip/tcp).
+// Rest of the packet (if any) will be silently truncated which is fine.
+#define SYZ_TUN_MAX_PACKET_SIZE 1000
+
+// Maximum number of tun devices in the default install.
+#define MAX_TUN 4
+
+// All patterns are non-expanding given values < MAX_TUN.
+#define TUN_IFACE "tap%d"
+#define TUN_DEVICE "/dev/tap%d"
+
+#define LOCAL_IPV4 "172.20.%d.170"
+#define LOCAL_IPV6 "fe80::%02hxaa"
+
+static void vsnprintf_check(char* str, size_t size, const char* format, va_list args)
+{
+	int rv;
+
+	rv = vsnprintf(str, size, format, args);
+	if (rv < 0)
+		fail("vsnprintf failed");
+	if ((size_t)rv >= size)
+		fail("vsnprintf: string '%s...' doesn't fit into buffer", str);
+}
+
+static void snprintf_check(char* str, size_t size, const char* format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf_check(str, size, format, args);
+	va_end(args);
+}
+
+#define COMMAND_MAX_LEN 128
+#define PATH_PREFIX "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
+#define PATH_PREFIX_LEN (sizeof(PATH_PREFIX) - 1)
+
+static void execute_command(bool panic, const char* format, ...)
+{
+	va_list args;
+	char command[PATH_PREFIX_LEN + COMMAND_MAX_LEN];
+	int rv;
+
+	va_start(args, format);
+	// Executor process does not have any env, including PATH.
+	// On some distributions, system/shell adds a minimal PATH, on some it does not.
+	// Set own standard PATH to make it work across distributions.
+	memcpy(command, PATH_PREFIX, PATH_PREFIX_LEN);
+	vsnprintf_check(command + PATH_PREFIX_LEN, COMMAND_MAX_LEN, format, args);
+	va_end(args);
+	rv = system(command);
+	if (rv) {
+		if (panic)
+			fail("command '%s' failed: %d", &command[0], rv);
+		debug("command '%s': %d\n", &command[0], rv);
+	}
+}
+
+static void initialize_tun(int tun_id)
+{
+#if SYZ_EXECUTOR
+	if (!flag_enable_tun)
+		return;
+#endif // SYZ_EXECUTOR
+
+	if (tun_id < 0 || tun_id >= MAX_TUN) {
+		fail("tun_id out of range %d\n", tun_id);
+	}
+
+	char tun_device[sizeof(TUN_DEVICE)];
+	snprintf_check(tun_device, sizeof(tun_device), TUN_DEVICE, tun_id);
+
+	tunfd = open(tun_device, O_RDWR | O_NONBLOCK);
+#if GOOS_freebsd
+	if ((tunfd < 0) && (errno == ENOENT)) {
+		execute_command(0, "kldload -q if_tap");
+		tunfd = open(tun_device, O_RDWR | O_NONBLOCK);
+	}
+#endif
+	if (tunfd == -1) {
+#if SYZ_EXECUTOR
+		fail("tun: can't open %s\n", tun_device);
+#else
+		printf("tun: can't open %s: errno=%d\n", tun_device, errno);
+		return;
+#endif // SYZ_EXECUTOR
+	}
+	// Remap tun onto higher fd number to hide it from fuzzer and to keep
+	// fd numbers stable regardless of whether tun is opened or not (also see kMaxFd).
+	const int kTunFd = 240;
+	if (dup2(tunfd, kTunFd) < 0)
+		fail("dup2(tunfd, kTunFd) failed");
+	close(tunfd);
+	tunfd = kTunFd;
+
+	char tun_iface[sizeof(TUN_IFACE)];
+	snprintf_check(tun_iface, sizeof(tun_iface), TUN_IFACE, tun_id);
+
+	char local_ipv4[sizeof(LOCAL_IPV4)];
+	snprintf_check(local_ipv4, sizeof(local_ipv4), LOCAL_IPV4, tun_id);
+	execute_command(1, "ifconfig %s inet %s", tun_iface, local_ipv4);
+
+	char local_ipv6[sizeof(LOCAL_IPV6)];
+	snprintf_check(local_ipv6, sizeof(local_ipv6), LOCAL_IPV6, tun_id);
+	execute_command(1, "ifconfig %s inet6 %s", tun_iface, local_ipv6);
+}
+
+#endif // SYZ_EXECUTOR || SYZ_TUN_ENABLE
+
+#if SYZ_EXECUTOR || __NR_syz_emit_ethernet && SYZ_TUN_ENABLE
+#include <stdbool.h>
+#include <sys/uio.h>
+
+static long syz_emit_ethernet(volatile long a0, volatile long a1)
+{
+	// syz_emit_ethernet(len len[packet], packet ptr[in, array[int8]])
+	if (tunfd < 0)
+		return (uintptr_t)-1;
+
+	size_t length = a0;
+	const char* data = (char*)a1;
+	debug_dump_data(data, length);
+
+	return write(tunfd, data, length);
+}
+#endif
+
+#if SYZ_EXECUTOR || SYZ_TUN_ENABLE && (__NR_syz_extract_tcp_res || SYZ_REPEAT)
+#include <errno.h>
+
+static int read_tun(char* data, int size)
+{
+	if (tunfd < 0)
+		return -1;
+
+	int rv = read(tunfd, data, size);
+	if (rv < 0) {
+		if (errno == EAGAIN)
+			return -1;
+		fail("tun: read failed with %d", rv);
+	}
+	return rv;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_extract_tcp_res && SYZ_TUN_ENABLE
+
+struct tcp_resources {
+	uint32 seq;
+	uint32 ack;
+};
+
+#if GOOS_freebsd
+#include <net/ethernet.h>
+#else
+#include <net/ethertypes.h>
+#endif
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+
+// Include order matters, empty line prevent re-sorting. See a workaround in
+// pkg/csource hoistIncludes.
+#include <netinet/if_ether.h>
+
+static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile long a2)
+{
+	// syz_extract_tcp_res(res ptr[out, tcp_resources], seq_inc int32, ack_inc int32)
+
+	if (tunfd < 0)
+		return (uintptr_t)-1;
+
+	char data[SYZ_TUN_MAX_PACKET_SIZE];
+	int rv = read_tun(&data[0], sizeof(data));
+	if (rv == -1)
+		return (uintptr_t)-1;
+	size_t length = rv;
+	debug_dump_data(data, length);
+
+	struct tcphdr* tcphdr;
+
+	if (length < sizeof(struct ether_header))
+		return (uintptr_t)-1;
+	struct ether_header* ethhdr = (struct ether_header*)&data[0];
+
+	if (ethhdr->ether_type == htons(ETHERTYPE_IP)) {
+		if (length < sizeof(struct ether_header) + sizeof(struct ip))
+			return (uintptr_t)-1;
+		struct ip* iphdr = (struct ip*)&data[sizeof(struct ether_header)];
+		if (iphdr->ip_p != IPPROTO_TCP)
+			return (uintptr_t)-1;
+		if (length < sizeof(struct ether_header) + iphdr->ip_hl * 4 + sizeof(struct tcphdr))
+			return (uintptr_t)-1;
+		tcphdr = (struct tcphdr*)&data[sizeof(struct ether_header) + iphdr->ip_hl * 4];
+	} else {
+		if (length < sizeof(struct ether_header) + sizeof(struct ip6_hdr))
+			return (uintptr_t)-1;
+		struct ip6_hdr* ipv6hdr = (struct ip6_hdr*)&data[sizeof(struct ether_header)];
+		// TODO: parse and skip extension headers.
+		if (ipv6hdr->ip6_nxt != IPPROTO_TCP)
+			return (uintptr_t)-1;
+		if (length < sizeof(struct ether_header) + sizeof(struct ip6_hdr) + sizeof(struct tcphdr))
+			return (uintptr_t)-1;
+		tcphdr = (struct tcphdr*)&data[sizeof(struct ether_header) + sizeof(struct ip6_hdr)];
+	}
+
+	struct tcp_resources* res = (struct tcp_resources*)a0;
+	NONFAILING(res->seq = htonl((ntohl(tcphdr->th_seq) + (uint32)a1)));
+	NONFAILING(res->ack = htonl((ntohl(tcphdr->th_ack) + (uint32)a2)));
+
+	debug("extracted seq: %08x\n", res->seq);
+	debug("extracted ack: %08x\n", res->ack);
+
+	return 0;
+}
+#endif
+#endif // GOOS_freebsd || GOOS_openbsd
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NONE
+
+#include <sys/resource.h>
+#include <unistd.h>
+
+static void sandbox_common()
+{
+	if (setsid() == -1)
+		fail("setsid failed");
+
+	// Some minimal sandboxing.
+	struct rlimit rlim;
+#ifdef GOOS_freebsd
+	// Documented bug in OpenBSD.
+	// This causes frequent random aborts. Reason unknown.
+
+	// This also causes ENOMEM on NetBSD during early init.
+	rlim.rlim_cur = rlim.rlim_max = 128 << 20;
+	setrlimit(RLIMIT_AS, &rlim);
+#endif
+	rlim.rlim_cur = rlim.rlim_max = 8 << 20;
+	setrlimit(RLIMIT_MEMLOCK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_FSIZE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_STACK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 0;
+	setrlimit(RLIMIT_CORE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 256; // see kMaxFd
+	setrlimit(RLIMIT_NOFILE, &rlim);
+}
+#endif //  SYZ_EXECUTOR || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NONE
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
+
+static void loop();
+
+static int do_sandbox_none(void)
+{
+	sandbox_common();
+#if (GOOS_freebsd || GOOS_openbsd) && (SYZ_EXECUTOR || SYZ_TUN_ENABLE)
+	initialize_tun(procid);
+#endif
+	loop();
+	return 0;
+}
+#endif // SYZ_EXECUTOR || SYZ_SANDBOX_NONE
+
+#if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID
+
+#include <sys/resource.h>
 #include <sys/wait.h>
-#include <time.h>
-#endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_USE_TMP_DIR))
-#include <dirent.h>
-#endif
+#include <unistd.h>
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||      \
-    defined(SYZ_USE_TMP_DIR) || defined(SYZ_HANDLE_SEGV) || defined(SYZ_TUN_ENABLE) || \
-    defined(SYZ_SANDBOX_NAMESPACE) || defined(SYZ_SANDBOX_SETUID) ||                   \
-    defined(SYZ_SANDBOX_NONE) || defined(SYZ_FAULT_INJECTION) || defined(__NR_syz_kvm_setup_cpu)
-__attribute__((noreturn)) static void doexit(int status)
+static void loop();
+
+static int wait_for_loop(int pid)
 {
-	_exit(status);
-	for (;;) {
+	if (pid < 0)
+		fail("sandbox fork failed");
+	debug("spawned loop pid %d\n", pid);
+	int status = 0;
+	while (waitpid(-1, &status, WUNTRACED) != pid) {
 	}
+	return WEXITSTATUS(status);
 }
+
+#define SYZ_HAVE_SANDBOX_SETUID 1
+static int do_sandbox_setuid(void)
+{
+	int pid = fork();
+	if (pid != 0)
+		return wait_for_loop(pid);
+
+	sandbox_common();
+#if (GOOS_freebsd || GOOS_openbsd) && (SYZ_EXECUTOR || SYZ_TUN_ENABLE)
+	initialize_tun(procid);
 #endif
 
-#include "common.h"
+	char pwbuf[1024];
+	struct passwd *pw, pwres;
+	if (getpwnam_r("nobody", &pwres, pwbuf, sizeof(pwbuf), &pw) != 0 || !pw)
+		fail("getpwnam_r(\"nobody\") failed");
 
-#if defined(SYZ_EXECUTOR) || defined(SYZ_HANDLE_SEGV)
-static __thread int skip_segv;
-static __thread jmp_buf segv_env;
+	if (setgroups(0, NULL))
+		fail("failed to setgroups");
+	if (setgid(pw->pw_gid))
+		fail("failed to setgid");
+	if (setuid(pw->pw_uid))
+		fail("failed to setuid");
 
-static void segv_handler(int sig, siginfo_t* info, void* uctx)
-{
-	// Generated programs can contain bad (unmapped/protected) addresses,
-	// which cause SIGSEGVs during copyin/copyout.
-	// This handler ignores such crashes to allow the program to proceed.
-	// We additionally opportunistically check that the faulty address
-	// is not within executable data region, because such accesses can corrupt
-	// output region and then fuzzer will fail on corrupted data.
-	uintptr_t addr = (uintptr_t)info->si_addr;
-	const uintptr_t prog_start = 1 << 20;
-	const uintptr_t prog_end = 100 << 20;
-	if (__atomic_load_n(&skip_segv, __ATOMIC_RELAXED) && (addr < prog_start || addr > prog_end)) {
-		debug("SIGSEGV on %p, skipping\n", (void*)addr);
-		_longjmp(segv_env, 1);
-	}
-	debug("SIGSEGV on %p, exiting\n", (void*)addr);
-	doexit(sig);
+	loop();
+	doexit(1);
 }
-
-static void install_segv_handler()
-{
-	struct sigaction sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = segv_handler;
-	sa.sa_flags = SA_NODEFER | SA_SIGINFO;
-	sigaction(SIGSEGV, &sa, NULL);
-	sigaction(SIGBUS, &sa, NULL);
-}
-
-#define NONFAILING(...)                                              \
-	{                                                            \
-		__atomic_fetch_add(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-		if (_setjmp(segv_env) == 0) {                        \
-			__VA_ARGS__;                                 \
-		}                                                    \
-		__atomic_fetch_sub(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-	}
-#endif
-
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-static uint64 current_time_ms()
-{
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts))
-		fail("clock_gettime failed");
-	return (uint64)ts.tv_sec * 1000 + (uint64)ts.tv_nsec / 1000000;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR)
-static void sleep_ms(uint64 ms)
-{
-	usleep(ms * 1000);
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_USE_TMP_DIR))
-static void remove_dir(const char* dir)
-{
-	DIR* dp;
-	struct dirent* ep;
-	int iter = 0;
-retry:
-	dp = opendir(dir);
-	if (dp == NULL)
-		return;
-	while ((ep = readdir(dp))) {
-		if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0)
-			continue;
-		char filename[FILENAME_MAX];
-		snprintf(filename, sizeof(filename), "%s/%s", dir, ep->d_name);
-		struct stat st;
-		if (lstat(filename, &st))
-			return;
-		if (S_ISDIR(st.st_mode)) {
-			remove_dir(filename);
-			continue;
-		}
-		int i;
-		for (i = 0;; i++) {
-			if (unlink(filename) == 0)
-				break;
-			if (errno == EROFS)
-				break;
-			if (errno != EBUSY || i > 100)
-				return;
-		}
-	}
-	closedir(dp);
-	int i;
-	for (i = 0;; i++) {
-		if (rmdir(dir) == 0)
-			break;
-		if (i < 100) {
-			if (errno == EROFS)
-				break;
-			if (errno == ENOTEMPTY) {
-				if (iter < 100) {
-					iter++;
-					goto retry;
-				}
-			}
-		}
-		return;
-	}
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_FAULT_INJECTION)
-static int inject_fault(int nth)
-{
-	return 0;
-}
-
-static int fault_injected(int fail_fd)
-{
-	return 0;
-}
-#endif
+#endif // SYZ_EXECUTOR || SYZ_SANDBOX_SETUID

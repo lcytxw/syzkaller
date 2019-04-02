@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,15 +24,17 @@ import (
 	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/gce"
 	"github.com/google/syzkaller/pkg/hash"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/instance"
+	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/repro"
-	. "github.com/google/syzkaller/pkg/rpctype"
+	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys"
-	"github.com/google/syzkaller/syz-manager/mgrconfig"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 )
 
@@ -45,18 +48,18 @@ type Manager struct {
 	cfg            *mgrconfig.Config
 	vmPool         *vm.Pool
 	target         *prog.Target
+	sysTarget      *targets.Target
 	reporter       report.Reporter
 	crashdir       string
 	port           int
 	corpusDB       *db.DB
 	startTime      time.Time
 	firstConnect   time.Time
-	lastPrioCalc   time.Time
 	fuzzingTime    time.Duration
-	stats          map[string]uint64
+	stats          *Stats
 	crashTypes     map[string]bool
 	vmStop         chan bool
-	vmChecked      bool
+	checkResult    *rpctype.CheckArgs
 	fresh          bool
 	numFuzzing     uint32
 	numReproducing uint32
@@ -65,23 +68,18 @@ type Manager struct {
 
 	mu              sync.Mutex
 	phase           int
-	enabledSyscalls string
-	enabledCalls    []string // as determined by fuzzer
+	enabledSyscalls []int
 
-	candidates     []RPCCandidate // untriaged inputs from corpus and hub
-	disabledHashes map[string]struct{}
-	corpus         map[string]RPCInput
-	corpusCover    cover.Cover
-	corpusSignal   signal.Signal
-	maxSignal      signal.Signal
-	prios          [][]float32
-	newRepros      [][]byte
+	candidates       []rpctype.RPCCandidate // untriaged inputs from corpus and hub
+	disabledHashes   map[string]struct{}
+	corpus           map[string]rpctype.RPCInput
+	newRepros        [][]byte
+	lastMinCorpus    int
+	memoryLeakFrames map[string]bool
 
-	fuzzers        map[string]*Fuzzer
-	hub            *RPCClient
-	hubCorpus      map[hash.Sig]bool
 	needMoreRepros chan chan bool
 	hubReproQueue  chan *Crash
+	reproRequest   chan chan map[string]bool
 
 	// For checking that files that we are using are not changing under us.
 	// Maps file name to modification time.
@@ -91,6 +89,8 @@ type Manager struct {
 const (
 	// Just started, nothing done yet.
 	phaseInit = iota
+	// Corpus is loaded and machine is checked.
+	phaseLoadedCorpus
 	// Triaged all inputs from corpus.
 	// This is when we start querying hub and minimizing persistent corpus.
 	phaseTriagedCorpus
@@ -101,13 +101,7 @@ const (
 	phaseTriagedHub
 )
 
-const currentDBVersion = 2
-
-type Fuzzer struct {
-	name         string
-	inputs       []RPCInput
-	newMaxSignal signal.Signal
-}
+const currentDBVersion = 3
 
 type Crash struct {
 	vmIndex int
@@ -117,133 +111,76 @@ type Crash struct {
 
 func main() {
 	if sys.GitRevision == "" {
-		Fatalf("Bad syz-manager build. Build with make, run bin/syz-manager.")
+		log.Fatalf("Bad syz-manager build. Build with make, run bin/syz-manager.")
 	}
 	flag.Parse()
-	EnableLogCaching(1000, 1<<20)
+	log.EnableLogCaching(1000, 1<<20)
 	cfg, err := mgrconfig.LoadFile(*flagConfig)
 	if err != nil {
-		Fatalf("%v", err)
+		log.Fatalf("%v", err)
 	}
 	target, err := prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
 	if err != nil {
-		Fatalf("%v", err)
+		log.Fatalf("%v", err)
 	}
-	syscalls, err := mgrconfig.ParseEnabledSyscalls(target, cfg.Enable_Syscalls, cfg.Disable_Syscalls)
+	sysTarget := targets.Get(cfg.TargetOS, cfg.TargetArch)
+	if sysTarget == nil {
+		log.Fatalf("unsupported OS/arch: %v/%v", cfg.TargetOS, cfg.TargetArch)
+	}
+	syscalls, err := mgrconfig.ParseEnabledSyscalls(target, cfg.EnabledSyscalls, cfg.DisabledSyscalls)
 	if err != nil {
-		Fatalf("%v", err)
+		log.Fatalf("%v", err)
 	}
-	initAllCover(cfg.Vmlinux)
-	RunManager(cfg, target, syscalls)
+	RunManager(cfg, target, sysTarget, syscalls)
 }
 
-func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]bool) {
-	env := mgrconfig.CreateVMEnv(cfg, *flagDebug)
-	vmPool, err := vm.Create(cfg.Type, env)
-	if err != nil {
-		Fatalf("%v", err)
+func RunManager(cfg *mgrconfig.Config, target *prog.Target, sysTarget *targets.Target, syscalls []int) {
+	var vmPool *vm.Pool
+	// Type "none" is a special case for debugging/development when manager
+	// does not start any VMs, but instead you start them manually
+	// and start syz-fuzzer there.
+	if cfg.Type != "none" {
+		var err error
+		vmPool, err = vm.Create(cfg, *flagDebug)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
 	}
 
 	crashdir := filepath.Join(cfg.Workdir, "crashes")
 	osutil.MkdirAll(crashdir)
 
-	enabledSyscalls := ""
-	if len(syscalls) != 0 {
-		buf := new(bytes.Buffer)
-		for c := range syscalls {
-			fmt.Fprintf(buf, ",%v", c)
-		}
-		enabledSyscalls = buf.String()[1:]
-		Logf(1, "enabled syscalls: %v", enabledSyscalls)
+	reporter, err := report.NewReporter(cfg)
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	mgr := &Manager{
-		cfg:             cfg,
-		vmPool:          vmPool,
-		target:          target,
-		crashdir:        crashdir,
-		startTime:       time.Now(),
-		stats:           make(map[string]uint64),
-		crashTypes:      make(map[string]bool),
-		enabledSyscalls: enabledSyscalls,
-		corpus:          make(map[string]RPCInput),
-		disabledHashes:  make(map[string]struct{}),
-		fuzzers:         make(map[string]*Fuzzer),
-		fresh:           true,
-		vmStop:          make(chan bool),
-		hubReproQueue:   make(chan *Crash, 10),
-		needMoreRepros:  make(chan chan bool),
-		usedFiles:       make(map[string]time.Time),
+		cfg:              cfg,
+		vmPool:           vmPool,
+		target:           target,
+		sysTarget:        sysTarget,
+		reporter:         reporter,
+		crashdir:         crashdir,
+		startTime:        time.Now(),
+		stats:            new(Stats),
+		crashTypes:       make(map[string]bool),
+		enabledSyscalls:  syscalls,
+		corpus:           make(map[string]rpctype.RPCInput),
+		disabledHashes:   make(map[string]struct{}),
+		memoryLeakFrames: make(map[string]bool),
+		fresh:            true,
+		vmStop:           make(chan bool),
+		hubReproQueue:    make(chan *Crash, 10),
+		needMoreRepros:   make(chan chan bool),
+		reproRequest:     make(chan chan map[string]bool),
+		usedFiles:        make(map[string]time.Time),
 	}
 
-	Logf(0, "loading corpus...")
+	log.Logf(0, "loading corpus...")
 	mgr.corpusDB, err = db.Open(filepath.Join(cfg.Workdir, "corpus.db"))
 	if err != nil {
-		Fatalf("failed to open corpus database: %v", err)
-	}
-	// By default we don't re-minimize/re-smash programs from corpus,
-	// it takes lots of time on start and is unnecessary.
-	// However, on version bumps we can selectively re-minimize/re-smash.
-	minimized, smashed := true, true
-	switch mgr.corpusDB.Version {
-	case 0:
-		// Version 0 had broken minimization, so we need to re-minimize.
-		minimized = false
-		fallthrough
-	case 1:
-		// Version 1->2: memory is preallocated so lots of mmaps become unnecessary.
-		minimized = false
-		fallthrough
-	case currentDBVersion:
-	}
-	deleted := 0
-	for key, rec := range mgr.corpusDB.Records {
-		p, err := mgr.target.Deserialize(rec.Val)
-		if err != nil {
-			if deleted < 10 {
-				Logf(0, "deleting broken program: %v\n%s", err, rec.Val)
-			}
-			mgr.corpusDB.Delete(key)
-			deleted++
-			continue
-		}
-		disabled := false
-		for _, c := range p.Calls {
-			if !syscalls[c.Meta.ID] {
-				disabled = true
-				break
-			}
-		}
-		if disabled {
-			// This program contains a disabled syscall.
-			// We won't execute it, but remember its hash so
-			// it is not deleted during minimization.
-			// TODO: use mgr.enabledCalls which accounts for missing devices, etc.
-			// But it is available only after vm check.
-			mgr.disabledHashes[hash.String(rec.Val)] = struct{}{}
-			continue
-		}
-		mgr.candidates = append(mgr.candidates, RPCCandidate{
-			Prog:      rec.Val,
-			Minimized: minimized,
-			Smashed:   smashed,
-		})
-	}
-	mgr.fresh = len(mgr.corpusDB.Records) == 0
-	Logf(0, "loaded %v programs (%v total, %v deleted)",
-		len(mgr.candidates), len(mgr.corpusDB.Records), deleted)
-
-	// Now this is ugly.
-	// We duplicate all inputs in the corpus and shuffle the second part.
-	// This solves the following problem. A fuzzer can crash while triaging candidates,
-	// in such case it will also lost all cached candidates. Or, the input can be somewhat flaky
-	// and doesn't give the coverage on first try. So we give each input the second chance.
-	// Shuffling should alleviate deterministically losing the same inputs on fuzzer crashing.
-	mgr.candidates = append(mgr.candidates, mgr.candidates...)
-	shuffle := mgr.candidates[len(mgr.candidates)/2:]
-	for i := range shuffle {
-		j := i + rand.Intn(len(shuffle)-i)
-		shuffle[i], shuffle[j] = shuffle[j], shuffle[i]
+		log.Fatalf("failed to open corpus database: %v", err)
 	}
 
 	// Create HTTP server.
@@ -251,16 +188,13 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]boo
 	mgr.collectUsedFiles()
 
 	// Create RPC server for fuzzers.
-	s, err := NewRPCServer(cfg.RPC, mgr)
+	mgr.port, err = startRPCServer(mgr)
 	if err != nil {
-		Fatalf("failed to create rpc server: %v", err)
+		log.Fatalf("failed to create rpc server: %v", err)
 	}
-	Logf(0, "serving rpc on tcp://%v", s.Addr())
-	mgr.port = s.Addr().(*net.TCPAddr).Port
-	go s.Serve()
 
-	if cfg.Dashboard_Addr != "" {
-		mgr.dash = dashapi.New(cfg.Dashboard_Client, cfg.Dashboard_Addr, cfg.Dashboard_Key)
+	if cfg.DashboardAddr != "" {
+		mgr.dash = dashapi.New(cfg.DashboardClient, cfg.DashboardAddr, cfg.DashboardKey)
 	}
 
 	go func() {
@@ -275,14 +209,14 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]boo
 				continue
 			}
 			mgr.fuzzingTime += diff * time.Duration(atomic.LoadUint32(&mgr.numFuzzing))
-			executed := mgr.stats["exec total"]
-			crashes := mgr.stats["crashes"]
-			signal := mgr.corpusSignal.Len()
+			executed := mgr.stats.execTotal.get()
+			crashes := mgr.stats.crashes.get()
+			signal := mgr.stats.corpusSignal.get()
 			mgr.mu.Unlock()
 			numReproducing := atomic.LoadUint32(&mgr.numReproducing)
 			numFuzzing := atomic.LoadUint32(&mgr.numFuzzing)
 
-			Logf(0, "VMs %v, executed %v, cover %v, crashes %v, repro %v",
+			log.Logf(0, "VMs %v, executed %v, cover %v, crashes %v, repro %v",
 				numFuzzing, executed, signal, crashes, numReproducing)
 		}
 	}()
@@ -290,12 +224,12 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]boo
 	if *flagBench != "" {
 		f, err := os.OpenFile(*flagBench, os.O_WRONLY|os.O_CREATE|os.O_EXCL, osutil.DefaultFilePerm)
 		if err != nil {
-			Fatalf("failed to open bench file: %v", err)
+			log.Fatalf("failed to open bench file: %v", err)
 		}
 		go func() {
 			for {
 				time.Sleep(time.Minute)
-				vals := make(map[string]uint64)
+				vals := mgr.stats.all()
 				mgr.mu.Lock()
 				if mgr.firstConnect.IsZero() {
 					mgr.mu.Unlock()
@@ -305,19 +239,14 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]boo
 				vals["corpus"] = uint64(len(mgr.corpus))
 				vals["uptime"] = uint64(time.Since(mgr.firstConnect)) / 1e9
 				vals["fuzzing"] = uint64(mgr.fuzzingTime) / 1e9
-				vals["signal"] = uint64(mgr.corpusSignal.Len())
-				vals["coverage"] = uint64(len(mgr.corpusCover))
-				for k, v := range mgr.stats {
-					vals[k] = v
-				}
 				mgr.mu.Unlock()
 
 				data, err := json.MarshalIndent(vals, "", "  ")
 				if err != nil {
-					Fatalf("failed to serialize bench data")
+					log.Fatalf("failed to serialize bench data")
 				}
 				if _, err := f.Write(append(data, '\n')); err != nil {
-					Fatalf("failed to write bench data")
+					log.Fatalf("failed to write bench data")
 				}
 			}
 		}()
@@ -327,16 +256,14 @@ func RunManager(cfg *mgrconfig.Config, target *prog.Target, syscalls map[int]boo
 		go mgr.dashboardReporter()
 	}
 
-	if mgr.cfg.Hub_Client != "" {
-		go func() {
-			for {
-				time.Sleep(time.Minute)
-				mgr.hubSync()
-			}
-		}()
-	}
-
 	osutil.HandleInterrupts(vm.Shutdown)
+	if mgr.vmPool == nil {
+		log.Logf(0, "no VMs started (type=none)")
+		log.Logf(0, "you are supposed to start syz-fuzzer manually as:")
+		log.Logf(0, "syz-fuzzer -manager=manager.ip:%v [other flags as necessary]", mgr.port)
+		<-vm.Shutdown
+		return
+	}
 	mgr.vmLoop()
 }
 
@@ -350,13 +277,16 @@ type ReproResult struct {
 	instances []int
 	title0    string
 	res       *repro.Result
+	stats     *repro.Stats
 	err       error
 	hub       bool // repro came from hub
 }
 
+// Manager needs to be refactored (#605).
+// nolint: gocyclo
 func (mgr *Manager) vmLoop() {
-	Logf(0, "booting test machines...")
-	Logf(0, "wait for the connection from test machine...")
+	log.Logf(0, "booting test machines...")
+	log.Logf(0, "wait for the connection from test machine...")
 	instancesPerRepro := 4
 	vmCount := mgr.vmPool.Count()
 	if instancesPerRepro > vmCount {
@@ -374,7 +304,7 @@ func (mgr *Manager) vmLoop() {
 	reproDone := make(chan *ReproResult, 1)
 	stopPending := false
 	shutdown := vm.Shutdown
-	for {
+	for shutdown != nil || len(instances) != vmCount {
 		mgr.mu.Lock()
 		phase := mgr.phase
 		mgr.mu.Unlock()
@@ -384,32 +314,15 @@ func (mgr *Manager) vmLoop() {
 				continue
 			}
 			delete(pendingRepro, crash)
-			if !crash.hub {
-				if mgr.dash == nil {
-					if !mgr.needRepro(crash) {
-						continue
-					}
-				} else {
-					cid := &dashapi.CrashID{
-						BuildID:   mgr.cfg.Tag,
-						Title:     crash.Title,
-						Corrupted: crash.Corrupted,
-					}
-					needRepro, err := mgr.dash.NeedRepro(cid)
-					if err != nil {
-						Logf(0, "dashboard.NeedRepro failed: %v", err)
-					}
-					if !needRepro {
-						continue
-					}
-				}
+			if !mgr.needRepro(crash) {
+				continue
 			}
-			Logf(1, "loop: add to repro queue '%v'", crash.Title)
+			log.Logf(1, "loop: add to repro queue '%v'", crash.Title)
 			reproducing[crash.Title] = true
 			reproQueue = append(reproQueue, crash)
 		}
 
-		Logf(1, "loop: phase=%v shutdown=%v instances=%v/%v %+v repro: pending=%v reproducing=%v queued=%v",
+		log.Logf(1, "loop: phase=%v shutdown=%v instances=%v/%v %+v repro: pending=%v reproducing=%v queued=%v",
 			phase, shutdown == nil, len(instances), vmCount, instances,
 			len(pendingRepro), len(reproducing), len(reproQueue))
 
@@ -418,11 +331,7 @@ func (mgr *Manager) vmLoop() {
 				len(reproQueue) != 0 && reproInstances+instancesPerRepro <= vmCount
 		}
 
-		if shutdown == nil {
-			if len(instances) == vmCount {
-				return
-			}
-		} else {
+		if shutdown != nil {
 			for canRepro() && len(instances) >= instancesPerRepro {
 				last := len(reproQueue) - 1
 				crash := reproQueue[last]
@@ -432,17 +341,17 @@ func (mgr *Manager) vmLoop() {
 				instances = instances[:len(instances)-instancesPerRepro]
 				reproInstances += instancesPerRepro
 				atomic.AddUint32(&mgr.numReproducing, 1)
-				Logf(1, "loop: starting repro of '%v' on instances %+v", crash.Title, vmIndexes)
+				log.Logf(1, "loop: starting repro of '%v' on instances %+v", crash.Title, vmIndexes)
 				go func() {
-					res, err := repro.Run(crash.Output, mgr.cfg, mgr.getReporter(), mgr.vmPool, vmIndexes)
-					reproDone <- &ReproResult{vmIndexes, crash.Title, res, err, crash.hub}
+					res, stats, err := repro.Run(crash.Output, mgr.cfg, mgr.reporter, mgr.vmPool, vmIndexes)
+					reproDone <- &ReproResult{vmIndexes, crash.Title, res, stats, err, crash.hub}
 				}()
 			}
 			for !canRepro() && len(instances) != 0 {
 				last := len(instances) - 1
 				idx := instances[last]
 				instances = instances[:last]
-				Logf(1, "loop: starting instance %v", idx)
+				log.Logf(1, "loop: starting instance %v", idx)
 				go func() {
 					crash, err := mgr.runInstance(idx)
 					runDone <- &RunResult{idx, crash, err}
@@ -455,23 +364,24 @@ func (mgr *Manager) vmLoop() {
 			stopRequest = mgr.vmStop
 		}
 
+	wait:
 		select {
 		case stopRequest <- true:
-			Logf(1, "loop: issued stop request")
+			log.Logf(1, "loop: issued stop request")
 			stopPending = true
 		case res := <-runDone:
-			Logf(1, "loop: instance %v finished, crash=%v", res.idx, res.crash != nil)
+			log.Logf(1, "loop: instance %v finished, crash=%v", res.idx, res.crash != nil)
 			if res.err != nil && shutdown != nil {
-				Logf(0, "%v", res.err)
+				log.Logf(0, "%v", res.err)
 			}
 			stopPending = false
 			instances = append(instances, res.idx)
 			// On shutdown qemu crashes with "qemu: terminating on signal 2",
 			// which we detect as "lost connection". Don't save that as crash.
-			if shutdown != nil && res.crash != nil && !mgr.isSuppressed(res.crash) {
+			if shutdown != nil && res.crash != nil {
 				needRepro := mgr.saveCrash(res.crash)
 				if needRepro {
-					Logf(1, "loop: add pending repro for '%v'", res.crash.Title)
+					log.Logf(1, "loop: add pending repro for '%v'", res.crash.Title)
 					pendingRepro[res.crash] = true
 				}
 			}
@@ -483,32 +393,116 @@ func (mgr *Manager) vmLoop() {
 				crepro = res.res.CRepro
 				title = res.res.Report.Title
 			}
-			Logf(1, "loop: repro on %+v finished '%v', repro=%v crepro=%v desc='%v'",
+			log.Logf(1, "loop: repro on %+v finished '%v', repro=%v crepro=%v desc='%v'",
 				res.instances, res.title0, res.res != nil, crepro, title)
 			if res.err != nil {
-				Logf(0, "repro failed: %v", res.err)
+				log.Logf(0, "repro failed: %v", res.err)
 			}
 			delete(reproducing, res.title0)
 			instances = append(instances, res.instances...)
 			reproInstances -= instancesPerRepro
 			if res.res == nil {
 				if !res.hub {
-					mgr.saveFailedRepro(res.title0)
+					mgr.saveFailedRepro(res.title0, res.stats)
 				}
 			} else {
-				mgr.saveRepro(res.res, res.hub)
+				mgr.saveRepro(res.res, res.stats, res.hub)
 			}
 		case <-shutdown:
-			Logf(1, "loop: shutting down...")
+			log.Logf(1, "loop: shutting down...")
 			shutdown = nil
 		case crash := <-mgr.hubReproQueue:
-			Logf(1, "loop: get repro from hub")
+			log.Logf(1, "loop: get repro from hub")
 			pendingRepro[crash] = true
 		case reply := <-mgr.needMoreRepros:
 			reply <- phase >= phaseTriagedHub &&
 				len(reproQueue)+len(pendingRepro)+len(reproducing) == 0
+			goto wait
+		case reply := <-mgr.reproRequest:
+			repros := make(map[string]bool)
+			for title := range reproducing {
+				repros[title] = true
+			}
+			reply <- repros
+			goto wait
 		}
 	}
+}
+
+func (mgr *Manager) loadCorpus() {
+	// By default we don't re-minimize/re-smash programs from corpus,
+	// it takes lots of time on start and is unnecessary.
+	// However, on version bumps we can selectively re-minimize/re-smash.
+	minimized, smashed := true, true
+	switch mgr.corpusDB.Version {
+	case 0:
+		// Version 0 had broken minimization, so we need to re-minimize.
+		minimized = false
+		fallthrough
+	case 1:
+		// Version 1->2: memory is preallocated so lots of mmaps become unnecessary.
+		minimized = false
+		fallthrough
+	case 2:
+		// Version 2->3: big-endian hints.
+		smashed = false
+		fallthrough
+	case currentDBVersion:
+	}
+	syscalls := make(map[int]bool)
+	for _, id := range mgr.checkResult.EnabledCalls[mgr.cfg.Sandbox] {
+		syscalls[id] = true
+	}
+	deleted := 0
+	for key, rec := range mgr.corpusDB.Records {
+		p, err := mgr.target.Deserialize(rec.Val, prog.NonStrict)
+		if err != nil {
+			if deleted < 10 {
+				log.Logf(0, "deleting broken program: %v\n%s", err, rec.Val)
+			}
+			mgr.corpusDB.Delete(key)
+			deleted++
+			continue
+		}
+		disabled := false
+		for _, c := range p.Calls {
+			if !syscalls[c.Meta.ID] {
+				disabled = true
+				break
+			}
+		}
+		if disabled {
+			// This program contains a disabled syscall.
+			// We won't execute it, but remember its hash so
+			// it is not deleted during minimization.
+			mgr.disabledHashes[hash.String(rec.Val)] = struct{}{}
+			continue
+		}
+		mgr.candidates = append(mgr.candidates, rpctype.RPCCandidate{
+			Prog:      rec.Val,
+			Minimized: minimized,
+			Smashed:   smashed,
+		})
+	}
+	mgr.fresh = len(mgr.corpusDB.Records) == 0
+	log.Logf(0, "%-24v: %v (%v deleted)", "corpus", len(mgr.candidates), deleted)
+
+	// Now this is ugly.
+	// We duplicate all inputs in the corpus and shuffle the second part.
+	// This solves the following problem. A fuzzer can crash while triaging candidates,
+	// in such case it will also lost all cached candidates. Or, the input can be somewhat flaky
+	// and doesn't give the coverage on first try. So we give each input the second chance.
+	// Shuffling should alleviate deterministically losing the same inputs on fuzzer crashing.
+	mgr.candidates = append(mgr.candidates, mgr.candidates...)
+	shuffle := mgr.candidates[len(mgr.candidates)/2:]
+	for i := range shuffle {
+		j := i + rand.Intn(len(shuffle)-i)
+		shuffle[i], shuffle[j] = shuffle[j], shuffle[i]
+	}
+	if mgr.phase != phaseInit {
+		panic(fmt.Sprintf("loadCorpus: bad phase %v", mgr.phase))
+	}
+	mgr.phase = phaseLoadedCorpus
 }
 
 func (mgr *Manager) runInstance(index int) (*Crash, error) {
@@ -532,8 +526,6 @@ func (mgr *Manager) runInstance(index int) (*Crash, error) {
 		return nil, fmt.Errorf("failed to copy binary: %v", err)
 	}
 
-	// Leak detection significantly slows down fuzzing, so detect leaks only on the first instance.
-	leak := mgr.cfg.Leak && index == 0
 	fuzzerV := 0
 	procs := mgr.cfg.Procs
 	if *flagDebug {
@@ -545,73 +537,77 @@ func (mgr *Manager) runInstance(index int) (*Crash, error) {
 	start := time.Now()
 	atomic.AddUint32(&mgr.numFuzzing, 1)
 	defer atomic.AddUint32(&mgr.numFuzzing, ^uint32(0))
-	cmd := fmt.Sprintf("%v -executor=%v -name=vm-%v -arch=%v -manager=%v -procs=%v"+
-		" -leak=%v -cover=%v -sandbox=%v -debug=%v -v=%d",
-		fuzzerBin, executorBin, index, mgr.cfg.TargetArch, fwdAddr, procs,
-		leak, mgr.cfg.Cover, mgr.cfg.Sandbox, *flagDebug, fuzzerV)
+	cmd := instance.FuzzerCmd(fuzzerBin, executorBin, fmt.Sprintf("vm-%v", index),
+		mgr.cfg.TargetOS, mgr.cfg.TargetArch, fwdAddr, mgr.cfg.Sandbox, procs, fuzzerV,
+		mgr.cfg.Cover, *flagDebug, false, false)
 	outc, errc, err := inst.Run(time.Hour, mgr.vmStop, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run fuzzer: %v", err)
 	}
 
-	rep := vm.MonitorExecution(outc, errc, mgr.getReporter(), false)
+	rep := inst.MonitorExecution(outc, errc, mgr.reporter, vm.ExitTimeout)
 	if rep == nil {
 		// This is the only "OK" outcome.
-		Logf(0, "vm-%v: running for %v, restarting", index, time.Since(start))
+		log.Logf(0, "vm-%v: running for %v, restarting", index, time.Since(start))
 		return nil, nil
 	}
-	cash := &Crash{
+	crash := &Crash{
 		vmIndex: index,
 		hub:     false,
 		Report:  rep,
 	}
-	return cash, nil
-}
-
-func (mgr *Manager) isSuppressed(crash *Crash) bool {
-	for _, re := range mgr.cfg.ParsedSuppressions {
-		if !re.Match(crash.Output) {
-			continue
-		}
-		Logf(1, "vm-%v: suppressing '%v' with '%v'", crash.vmIndex, crash.Title, re.String())
-		mgr.mu.Lock()
-		mgr.stats["suppressed"]++
-		mgr.mu.Unlock()
-		return true
-	}
-	return false
+	return crash, nil
 }
 
 func (mgr *Manager) emailCrash(crash *Crash) {
-	if len(mgr.cfg.Email_Addrs) == 0 {
+	if len(mgr.cfg.EmailAddrs) == 0 {
 		return
 	}
 	args := []string{"-s", "syzkaller: " + crash.Title}
-	args = append(args, mgr.cfg.Email_Addrs...)
-	Logf(0, "sending email to %v", mgr.cfg.Email_Addrs)
+	args = append(args, mgr.cfg.EmailAddrs...)
+	log.Logf(0, "sending email to %v", mgr.cfg.EmailAddrs)
 
 	cmd := exec.Command("mailx", args...)
 	cmd.Stdin = bytes.NewReader(crash.Report.Report)
 	if _, err := osutil.Run(10*time.Minute, cmd); err != nil {
-		Logf(0, "failed to send email: %v", err)
+		log.Logf(0, "failed to send email: %v", err)
 	}
 }
 
 func (mgr *Manager) saveCrash(crash *Crash) bool {
-	Logf(0, "vm-%v: crash: %v", crash.vmIndex, crash.Title)
-	if err := mgr.getReporter().Symbolize(crash.Report); err != nil {
-		Logf(0, "failed to symbolize report: %v", err)
+	isMemoryLeak := strings.HasPrefix(crash.Title, report.MemoryLeakPrefix)
+	if isMemoryLeak {
+		frame := crash.Title[len(report.MemoryLeakPrefix):]
+		mgr.mu.Lock()
+		mgr.memoryLeakFrames[frame] = true
+		mgr.mu.Unlock()
+	}
+	if crash.Suppressed {
+		log.Logf(0, "vm-%v: suppressed crash %v", crash.vmIndex, crash.Title)
+		mgr.stats.crashSuppressed.inc()
+		return false
+	}
+	corrupted := ""
+	if crash.Corrupted {
+		corrupted = " [corrupted]"
+	}
+	log.Logf(0, "vm-%v: crash: %v%v", crash.vmIndex, crash.Title, corrupted)
+	if err := mgr.reporter.Symbolize(crash.Report); err != nil {
+		log.Logf(0, "failed to symbolize report: %v", err)
 	}
 
+	mgr.stats.crashes.inc()
 	mgr.mu.Lock()
-	mgr.stats["crashes"]++
 	if !mgr.crashTypes[crash.Title] {
 		mgr.crashTypes[crash.Title] = true
-		mgr.stats["crash types"]++
+		mgr.stats.crashTypes.inc()
 	}
 	mgr.mu.Unlock()
 
 	if mgr.dash != nil {
+		if isMemoryLeak {
+			return true
+		}
 		dc := &dashapi.Crash{
 			BuildID:     mgr.cfg.Tag,
 			Title:       crash.Title,
@@ -622,7 +618,7 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
 		}
 		resp, err := mgr.dash.ReportCrash(dc)
 		if err != nil {
-			Logf(0, "failed to report crash to dashboard: %v", err)
+			log.Logf(0, "failed to report crash to dashboard: %v", err)
 		} else {
 			// Don't store the crash locally, if we've successfully
 			// uploaded it to the dashboard. These will just eat disk space.
@@ -635,7 +631,7 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
 	dir := filepath.Join(mgr.crashdir, id)
 	osutil.MkdirAll(dir)
 	if err := osutil.WriteFile(filepath.Join(dir, "description"), []byte(crash.Title+"\n")); err != nil {
-		Logf(0, "failed to write crash: %v", err)
+		log.Logf(0, "failed to write crash: %v", err)
 	}
 	// Save up to 100 reports. If we already have 100, overwrite the oldest one.
 	// Newer reports are generally more useful. Overwriting is also needed
@@ -664,12 +660,12 @@ func (mgr *Manager) saveCrash(crash *Crash) bool {
 		osutil.WriteFile(filepath.Join(dir, fmt.Sprintf("report%v", oldestI)), crash.Report.Report)
 	}
 
-	return mgr.needRepro(crash)
+	return mgr.needLocalRepro(crash)
 }
 
 const maxReproAttempts = 3
 
-func (mgr *Manager) needRepro(crash *Crash) bool {
+func (mgr *Manager) needLocalRepro(crash *Crash) bool {
 	if !mgr.cfg.Reproduce || crash.Corrupted {
 		return false
 	}
@@ -686,68 +682,63 @@ func (mgr *Manager) needRepro(crash *Crash) bool {
 	return false
 }
 
-func (mgr *Manager) saveFailedRepro(desc string) {
+func (mgr *Manager) needRepro(crash *Crash) bool {
+	if crash.hub {
+		return true
+	}
+	if mgr.dash == nil {
+		return mgr.needLocalRepro(crash)
+	}
+	if strings.HasPrefix(crash.Title, report.MemoryLeakPrefix) {
+		return true
+	}
+	cid := &dashapi.CrashID{
+		BuildID:   mgr.cfg.Tag,
+		Title:     crash.Title,
+		Corrupted: crash.Corrupted,
+	}
+	needRepro, err := mgr.dash.NeedRepro(cid)
+	if err != nil {
+		log.Logf(0, "dashboard.NeedRepro failed: %v", err)
+	}
+	return needRepro
+}
+
+func (mgr *Manager) saveFailedRepro(title string, stats *repro.Stats) {
+	if strings.HasPrefix(title, report.MemoryLeakPrefix) {
+		// Don't send failed leak repro attempts to dashboard
+		// as we did not send the crash itself.
+		return
+	}
 	if mgr.dash != nil {
 		cid := &dashapi.CrashID{
 			BuildID: mgr.cfg.Tag,
-			Title:   desc,
+			Title:   title,
 		}
 		if err := mgr.dash.ReportFailedRepro(cid); err != nil {
-			Logf(0, "failed to report failed repro to dashboard: %v", err)
+			log.Logf(0, "failed to report failed repro to dashboard: %v", err)
+		} else {
+			return
 		}
 	}
-	dir := filepath.Join(mgr.crashdir, hash.String([]byte(desc)))
+	dir := filepath.Join(mgr.crashdir, hash.String([]byte(title)))
 	osutil.MkdirAll(dir)
 	for i := 0; i < maxReproAttempts; i++ {
 		name := filepath.Join(dir, fmt.Sprintf("repro%v", i))
 		if !osutil.IsExist(name) {
-			osutil.WriteFile(name, nil)
+			saveReproStats(name, stats)
 			break
 		}
 	}
 }
 
-func (mgr *Manager) saveRepro(res *repro.Result, hub bool) {
+func (mgr *Manager) saveRepro(res *repro.Result, stats *repro.Stats, hub bool) {
 	rep := res.Report
-	if err := mgr.getReporter().Symbolize(rep); err != nil {
-		Logf(0, "failed to symbolize repro: %v", err)
-	}
-	dir := filepath.Join(mgr.crashdir, hash.String([]byte(rep.Title)))
-	osutil.MkdirAll(dir)
-
-	if err := osutil.WriteFile(filepath.Join(dir, "description"), []byte(rep.Title+"\n")); err != nil {
-		Logf(0, "failed to write crash: %v", err)
+	if err := mgr.reporter.Symbolize(rep); err != nil {
+		log.Logf(0, "failed to symbolize repro: %v", err)
 	}
 	opts := fmt.Sprintf("# %+v\n", res.Opts)
 	prog := res.Prog.Serialize()
-	osutil.WriteFile(filepath.Join(dir, "repro.prog"), append([]byte(opts), prog...))
-	if len(mgr.cfg.Tag) > 0 {
-		osutil.WriteFile(filepath.Join(dir, "repro.tag"), []byte(mgr.cfg.Tag))
-	}
-	if len(rep.Output) > 0 {
-		osutil.WriteFile(filepath.Join(dir, "repro.log"), rep.Output)
-	}
-	if len(rep.Report) > 0 {
-		osutil.WriteFile(filepath.Join(dir, "repro.report"), rep.Report)
-	}
-	osutil.WriteFile(filepath.Join(dir, "repro.stats.log"), res.Stats.Log)
-	stats := fmt.Sprintf("Extracting prog: %s\nMinimizing prog: %s\nSimplifying prog options: %s\nExtracting C: %s\nSimplifying C: %s\n",
-		res.Stats.ExtractProgTime, res.Stats.MinimizeProgTime, res.Stats.SimplifyProgTime, res.Stats.ExtractCTime, res.Stats.SimplifyCTime)
-	osutil.WriteFile(filepath.Join(dir, "repro.stats"), []byte(stats))
-	var cprogText []byte
-	if res.CRepro {
-		cprog, err := csource.Write(res.Prog, res.Opts)
-		if err == nil {
-			formatted, err := csource.Format(cprog)
-			if err == nil {
-				cprog = formatted
-			}
-			osutil.WriteFile(filepath.Join(dir, "repro.cprog"), cprog)
-			cprogText = cprog
-		} else {
-			Logf(0, "failed to write C source: %v", err)
-		}
-	}
 
 	// Append this repro to repro list to send to hub if it didn't come from hub originally.
 	if !hub {
@@ -756,6 +747,20 @@ func (mgr *Manager) saveRepro(res *repro.Result, hub bool) {
 		mgr.mu.Lock()
 		mgr.newRepros = append(mgr.newRepros, progForHub)
 		mgr.mu.Unlock()
+	}
+
+	var cprogText []byte
+	if res.CRepro {
+		cprog, err := csource.Write(res.Prog, res.Opts)
+		if err == nil {
+			formatted, err := csource.Format(cprog)
+			if err == nil {
+				cprog = formatted
+			}
+			cprogText = cprog
+		} else {
+			log.Logf(0, "failed to write C source: %v", err)
+		}
 	}
 
 	if mgr.dash != nil {
@@ -775,414 +780,215 @@ func (mgr *Manager) saveRepro(res *repro.Result, hub bool) {
 			ReproC:      cprogText,
 		}
 		if _, err := mgr.dash.ReportCrash(dc); err != nil {
-			Logf(0, "failed to report repro to dashboard: %v", err)
+			log.Logf(0, "failed to report repro to dashboard: %v", err)
+		} else {
+			// Don't store the crash locally, if we've successfully
+			// uploaded it to the dashboard. These will just eat disk space.
+			return
 		}
 	}
+
+	dir := filepath.Join(mgr.crashdir, hash.String([]byte(rep.Title)))
+	osutil.MkdirAll(dir)
+
+	if err := osutil.WriteFile(filepath.Join(dir, "description"), []byte(rep.Title+"\n")); err != nil {
+		log.Logf(0, "failed to write crash: %v", err)
+	}
+	osutil.WriteFile(filepath.Join(dir, "repro.prog"), append([]byte(opts), prog...))
+	if len(mgr.cfg.Tag) > 0 {
+		osutil.WriteFile(filepath.Join(dir, "repro.tag"), []byte(mgr.cfg.Tag))
+	}
+	if len(rep.Output) > 0 {
+		osutil.WriteFile(filepath.Join(dir, "repro.log"), rep.Output)
+	}
+	if len(rep.Report) > 0 {
+		osutil.WriteFile(filepath.Join(dir, "repro.report"), rep.Report)
+	}
+	if len(cprogText) > 0 {
+		osutil.WriteFile(filepath.Join(dir, "repro.cprog"), cprogText)
+	}
+	saveReproStats(filepath.Join(dir, "repro.stats"), stats)
 }
 
-func (mgr *Manager) getReporter() report.Reporter {
-	if mgr.reporter == nil {
-		<-allSymbolsReady
-		var err error
-		// TODO(dvyukov): we should introduce cfg.Kernel_Obj dir instead of Vmlinux.
-		// This will be more general taking into account modules and other OSes.
-		kernelSrc, kernelObj := "", ""
-		if mgr.cfg.Vmlinux != "" {
-			kernelSrc = mgr.cfg.Kernel_Src
-			kernelObj = filepath.Dir(mgr.cfg.Vmlinux)
-		}
-		mgr.reporter, err = report.NewReporter(mgr.cfg.TargetOS, kernelSrc, kernelObj,
-			allSymbols, mgr.cfg.ParsedIgnores)
-		if err != nil {
-			Fatalf("%v", err)
+func saveReproStats(filename string, stats *repro.Stats) {
+	text := ""
+	if stats != nil {
+		text = fmt.Sprintf("Extracting prog: %v\nMinimizing prog: %v\n"+
+			"Simplifying prog options: %v\nExtracting C: %v\nSimplifying C: %v\n\n\n%s",
+			stats.ExtractProgTime, stats.MinimizeProgTime,
+			stats.SimplifyProgTime, stats.ExtractCTime, stats.SimplifyCTime, stats.Log)
+	}
+	osutil.WriteFile(filename, []byte(text))
+}
+
+func (mgr *Manager) getMinimizedCorpus() (corpus, repros [][]byte) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.minimizeCorpus()
+	corpus = make([][]byte, 0, len(mgr.corpus))
+	for _, inp := range mgr.corpus {
+		corpus = append(corpus, inp.Prog)
+	}
+	repros = mgr.newRepros
+	mgr.newRepros = nil
+	return
+}
+
+func (mgr *Manager) addNewCandidates(progs [][]byte) {
+	candidates := make([]rpctype.RPCCandidate, len(progs))
+	for i, inp := range progs {
+		candidates[i] = rpctype.RPCCandidate{
+			Prog:      inp,
+			Minimized: false, // don't trust programs from hub
+			Smashed:   false,
 		}
 	}
-	return mgr.reporter
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.candidates = append(mgr.candidates, candidates...)
+	if mgr.phase == phaseTriagedCorpus {
+		mgr.phase = phaseQueriedHub
+	}
 }
 
 func (mgr *Manager) minimizeCorpus() {
-	if mgr.cfg.Cover && len(mgr.corpus) != 0 {
-		inputs := make([]signal.Context, 0, len(mgr.corpus))
-		for _, inp := range mgr.corpus {
-			inputs = append(inputs, signal.Context{
-				Signal:  inp.Signal.Deserialize(),
-				Context: inp,
-			})
-		}
-		newCorpus := make(map[string]RPCInput)
-		for _, ctx := range signal.Minimize(inputs) {
-			inp := ctx.(RPCInput)
-			newCorpus[hash.String(inp.Prog)] = inp
-		}
-		Logf(1, "minimized corpus: %v -> %v", len(mgr.corpus), len(newCorpus))
-		mgr.corpus = newCorpus
+	if mgr.phase < phaseLoadedCorpus || len(mgr.corpus) <= mgr.lastMinCorpus*101/100 {
+		return
 	}
+	inputs := make([]signal.Context, 0, len(mgr.corpus))
+	for _, inp := range mgr.corpus {
+		inputs = append(inputs, signal.Context{
+			Signal:  inp.Signal.Deserialize(),
+			Context: inp,
+		})
+	}
+	newCorpus := make(map[string]rpctype.RPCInput)
+	for _, ctx := range signal.Minimize(inputs) {
+		inp := ctx.(rpctype.RPCInput)
+		newCorpus[hash.String(inp.Prog)] = inp
+	}
+	log.Logf(1, "minimized corpus: %v -> %v", len(mgr.corpus), len(newCorpus))
+	mgr.corpus = newCorpus
+	mgr.lastMinCorpus = len(newCorpus)
 
 	// Don't minimize persistent corpus until fuzzers have triaged all inputs from it.
-	if mgr.phase >= phaseTriagedCorpus {
-		for key := range mgr.corpusDB.Records {
-			_, ok1 := mgr.corpus[key]
-			_, ok2 := mgr.disabledHashes[key]
-			if !ok1 && !ok2 {
-				mgr.corpusDB.Delete(key)
-			}
-		}
-		mgr.corpusDB.BumpVersion(currentDBVersion)
+	if mgr.phase < phaseTriagedCorpus {
+		return
 	}
+	for key := range mgr.corpusDB.Records {
+		_, ok1 := mgr.corpus[key]
+		_, ok2 := mgr.disabledHashes[key]
+		if !ok1 && !ok2 {
+			mgr.corpusDB.Delete(key)
+		}
+	}
+	mgr.corpusDB.BumpVersion(currentDBVersion)
 }
 
-func (mgr *Manager) Connect(a *ConnectArgs, r *ConnectRes) error {
-	Logf(1, "fuzzer %v connected", a.Name)
+func (mgr *Manager) fuzzerConnect() ([]rpctype.RPCInput, [][]byte) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
-	if mgr.firstConnect.IsZero() {
-		mgr.firstConnect = time.Now()
-		Logf(0, "received first connection from test machine %v", a.Name)
-	}
-
-	mgr.stats["vm restarts"]++
-	f := &Fuzzer{
-		name: a.Name,
-	}
-	mgr.fuzzers[a.Name] = f
 	mgr.minimizeCorpus()
-
-	if mgr.prios == nil || time.Since(mgr.lastPrioCalc) > 30*time.Minute {
-		// Deserializing all programs is slow, so we do it episodically and without holding the mutex.
-		mgr.lastPrioCalc = time.Now()
-		inputs := make([][]byte, 0, len(mgr.corpus))
-		for _, inp := range mgr.corpus {
-			inputs = append(inputs, inp.Prog)
-		}
-		mgr.mu.Unlock()
-
-		corpus := make([]*prog.Prog, 0, len(inputs))
-		for _, inp := range inputs {
-			p, err := mgr.target.Deserialize(inp)
-			if err != nil {
-				panic(err)
-			}
-			corpus = append(corpus, p)
-		}
-		prios := mgr.target.CalculatePriorities(corpus)
-
-		mgr.mu.Lock()
-		mgr.prios = prios
-	}
-
+	corpus := make([]rpctype.RPCInput, 0, len(mgr.corpus))
 	for _, inp := range mgr.corpus {
-		r.Inputs = append(r.Inputs, inp)
+		corpus = append(corpus, inp)
 	}
-	r.Prios = mgr.prios
-	r.EnabledCalls = mgr.enabledSyscalls
-	r.NeedCheck = !mgr.vmChecked
-	r.MaxSignal = mgr.maxSignal.Serialize()
-	for i := 0; i < mgr.cfg.Procs && len(mgr.candidates) > 0; i++ {
+	memoryLeakFrames := make([][]byte, 0, len(mgr.memoryLeakFrames))
+	for frame := range mgr.memoryLeakFrames {
+		memoryLeakFrames = append(memoryLeakFrames, []byte(frame))
+	}
+	return corpus, memoryLeakFrames
+}
+
+func (mgr *Manager) machineChecked(a *rpctype.CheckArgs) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if len(mgr.cfg.EnabledSyscalls) != 0 && len(a.DisabledCalls[mgr.cfg.Sandbox]) != 0 {
+		disabled := make(map[string]string)
+		for _, dc := range a.DisabledCalls[mgr.cfg.Sandbox] {
+			disabled[mgr.target.Syscalls[dc.ID].Name] = dc.Reason
+		}
+		for _, id := range mgr.enabledSyscalls {
+			name := mgr.target.Syscalls[id].Name
+			if reason := disabled[name]; reason != "" {
+				log.Logf(0, "disabling %v: %v", name, reason)
+			}
+		}
+	}
+	if a.Error != "" {
+		log.Fatalf("machine check: %v", a.Error)
+	}
+	log.Logf(0, "machine check:")
+	log.Logf(0, "%-24v: %v/%v", "syscalls",
+		len(a.EnabledCalls[mgr.cfg.Sandbox]), len(mgr.target.Syscalls))
+	for _, feat := range a.Features {
+		log.Logf(0, "%-24v: %v", feat.Name, feat.Reason)
+	}
+	mgr.checkResult = a
+	mgr.loadCorpus()
+	mgr.firstConnect = time.Now()
+}
+
+func (mgr *Manager) newInput(inp rpctype.RPCInput, sign signal.Signal) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	sig := hash.String(inp.Prog)
+	if old, ok := mgr.corpus[sig]; ok {
+		// The input is already present, but possibly with diffent signal/coverage/call.
+		sign.Merge(old.Signal.Deserialize())
+		old.Signal = sign.Serialize()
+		var cov cover.Cover
+		cov.Merge(old.Cover)
+		cov.Merge(inp.Cover)
+		old.Cover = cov.Serialize()
+		mgr.corpus[sig] = old
+	} else {
+		mgr.corpus[sig] = inp
+		mgr.corpusDB.Save(sig, inp.Prog, 0)
+		if err := mgr.corpusDB.Flush(); err != nil {
+			log.Logf(0, "failed to save corpus database: %v", err)
+		}
+	}
+}
+
+func (mgr *Manager) candidateBatch(size int) []rpctype.RPCCandidate {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	var res []rpctype.RPCCandidate
+	for i := 0; i < size && len(mgr.candidates) > 0; i++ {
 		last := len(mgr.candidates) - 1
-		r.Candidates = append(r.Candidates, mgr.candidates[last])
+		res = append(res, mgr.candidates[last])
+		mgr.candidates[last] = rpctype.RPCCandidate{}
 		mgr.candidates = mgr.candidates[:last]
 	}
 	if len(mgr.candidates) == 0 {
 		mgr.candidates = nil
-	}
-	return nil
-}
-
-func (mgr *Manager) Check(a *CheckArgs, r *int) error {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	if mgr.vmChecked {
-		return nil
-	}
-	Logf(0, "machine check: %v calls enabled, kcov=%v, kleakcheck=%v, faultinjection=%v, comps=%v",
-		len(a.Calls), a.Kcov, a.Leak, a.Fault, a.CompsSupported)
-	if len(a.Calls) == 0 {
-		Fatalf("no system calls enabled")
-	}
-	if mgr.cfg.Cover && !a.Kcov {
-		Fatalf("/sys/kernel/debug/kcov is missing. Enable CONFIG_KCOV and mount debugfs")
-	}
-	if mgr.cfg.Sandbox == "namespace" && !a.UserNamespaces {
-		Fatalf("/proc/self/ns/user is missing or permission is denied. Requested namespace sandbox but user namespaces are not enabled. Enable CONFIG_USER_NS")
-	}
-	if mgr.target.Arch != a.ExecutorArch {
-		Fatalf("mismatching target/executor arch: target=%v executor=%v",
-			mgr.target.Arch, a.ExecutorArch)
-	}
-	if sys.GitRevision != a.FuzzerGitRev || sys.GitRevision != a.ExecutorGitRev {
-		Fatalf("mismatching git revisions:\nmanager= %v\nfuzzer=  %v\nexecutor=%v",
-			sys.GitRevision, a.FuzzerGitRev, a.ExecutorGitRev)
-	}
-	if mgr.target.Revision != a.FuzzerSyzRev || mgr.target.Revision != a.ExecutorSyzRev {
-		Fatalf("mismatching syscall descriptions:\nmanager= %v\nfuzzer=  %v\nexecutor=%v",
-			mgr.target.Revision, a.FuzzerSyzRev, a.ExecutorSyzRev)
-	}
-	mgr.vmChecked = true
-	mgr.enabledCalls = a.Calls
-	return nil
-}
-
-func (mgr *Manager) NewInput(a *NewInputArgs, r *int) error {
-	inputSignal := a.Signal.Deserialize()
-	Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",
-		a.Name, a.Call, inputSignal.Len(), len(a.Cover))
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	f := mgr.fuzzers[a.Name]
-	if f == nil {
-		Fatalf("fuzzer %v is not connected", a.Name)
-	}
-
-	if _, err := mgr.target.Deserialize(a.RPCInput.Prog); err != nil {
-		// This should not happen, but we see such cases episodically, reason unknown.
-		Logf(0, "failed to deserialize program from fuzzer: %v\n%s", err, a.RPCInput.Prog)
-		return nil
-	}
-	if mgr.corpusSignal.Diff(inputSignal).Empty() {
-		return nil
-	}
-	mgr.stats["manager new inputs"]++
-	mgr.corpusSignal.Merge(inputSignal)
-	mgr.corpusCover.Merge(a.Cover)
-	sig := hash.String(a.RPCInput.Prog)
-	if inp, ok := mgr.corpus[sig]; ok {
-		// The input is already present, but possibly with diffent signal/coverage/call.
-		inputSignal.Merge(inp.Signal.Deserialize())
-		inp.Signal = inputSignal.Serialize()
-		var inputCover cover.Cover
-		inputCover.Merge(inp.Cover)
-		inputCover.Merge(a.RPCInput.Cover)
-		inp.Cover = inputCover.Serialize()
-		mgr.corpus[sig] = inp
-	} else {
-		mgr.corpus[sig] = a.RPCInput
-		mgr.corpusDB.Save(sig, a.RPCInput.Prog, 0)
-		if err := mgr.corpusDB.Flush(); err != nil {
-			Logf(0, "failed to save corpus database: %v", err)
-		}
-		for _, f1 := range mgr.fuzzers {
-			if f1 == f {
-				continue
-			}
-			inp := a.RPCInput
-			inp.Cover = nil // Don't send coverage back to all fuzzers.
-			f1.inputs = append(f1.inputs, inp)
-		}
-	}
-	return nil
-}
-
-func (mgr *Manager) Poll(a *PollArgs, r *PollRes) error {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	for k, v := range a.Stats {
-		mgr.stats[k] += v
-	}
-
-	f := mgr.fuzzers[a.Name]
-	if f == nil {
-		Fatalf("fuzzer %v is not connected", a.Name)
-	}
-	newMaxSignal := mgr.maxSignal.Diff(a.MaxSignal.Deserialize())
-	if !newMaxSignal.Empty() {
-		mgr.maxSignal.Merge(newMaxSignal)
-		for _, f1 := range mgr.fuzzers {
-			if f1 == f {
-				continue
-			}
-			f1.newMaxSignal.Merge(newMaxSignal)
-		}
-	}
-	if !f.newMaxSignal.Empty() {
-		r.MaxSignal = f.newMaxSignal.Serialize()
-		f.newMaxSignal = nil
-	}
-	for i := 0; i < 100 && len(f.inputs) > 0; i++ {
-		last := len(f.inputs) - 1
-		r.NewInputs = append(r.NewInputs, f.inputs[last])
-		f.inputs = f.inputs[:last]
-	}
-	if len(f.inputs) == 0 {
-		f.inputs = nil
-	}
-
-	if a.NeedCandidates {
-		for i := 0; i < mgr.cfg.Procs && len(mgr.candidates) > 0; i++ {
-			last := len(mgr.candidates) - 1
-			r.Candidates = append(r.Candidates, mgr.candidates[last])
-			mgr.candidates = mgr.candidates[:last]
-		}
-	}
-	if len(mgr.candidates) == 0 {
-		mgr.candidates = nil
-		if mgr.phase == phaseInit {
-			if mgr.cfg.Hub_Client != "" {
+		if mgr.phase == phaseLoadedCorpus {
+			if mgr.cfg.HubClient != "" {
 				mgr.phase = phaseTriagedCorpus
+				go mgr.hubSyncLoop()
 			} else {
 				mgr.phase = phaseTriagedHub
 			}
-		}
-	}
-	Logf(4, "poll from %v: candidates=%v inputs=%v", a.Name, len(r.Candidates), len(r.NewInputs))
-	return nil
-}
-
-func (mgr *Manager) hubSync() {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
-	switch mgr.phase {
-	case phaseInit:
-		return
-	case phaseTriagedCorpus:
-		mgr.phase = phaseQueriedHub
-	case phaseQueriedHub:
-		if len(mgr.candidates) == 0 {
+		} else if mgr.phase == phaseQueriedHub {
 			mgr.phase = phaseTriagedHub
 		}
-	case phaseTriagedHub:
-	default:
-		panic("unknown phase")
 	}
-
-	mgr.minimizeCorpus()
-	if mgr.hub == nil {
-		a := &HubConnectArgs{
-			Client:  mgr.cfg.Hub_Client,
-			Key:     mgr.cfg.Hub_Key,
-			Manager: mgr.cfg.Name,
-			Fresh:   mgr.fresh,
-			Calls:   mgr.enabledCalls,
-		}
-		hubCorpus := make(map[hash.Sig]bool)
-		for _, inp := range mgr.corpus {
-			hubCorpus[hash.Hash(inp.Prog)] = true
-			a.Corpus = append(a.Corpus, inp.Prog)
-		}
-		mgr.mu.Unlock()
-		// Hub.Connect request can be very large, so do it on a transient connection
-		// (rpc connection buffers never shrink).
-		// Also don't do hub rpc's under the mutex -- hub can be slow or inaccessible.
-		if err := RPCCall(mgr.cfg.Hub_Addr, "Hub.Connect", a, nil); err != nil {
-			mgr.mu.Lock()
-			Logf(0, "Hub.Connect rpc failed: %v", err)
-			return
-		}
-		conn, err := NewRPCClient(mgr.cfg.Hub_Addr)
-		if err != nil {
-			mgr.mu.Lock()
-			Logf(0, "failed to connect to hub at %v: %v", mgr.cfg.Hub_Addr, err)
-			return
-		}
-		mgr.mu.Lock()
-		mgr.hub = conn
-		mgr.hubCorpus = hubCorpus
-		mgr.fresh = false
-		Logf(0, "connected to hub at %v, corpus %v", mgr.cfg.Hub_Addr, len(mgr.corpus))
-	}
-
-	a := &HubSyncArgs{
-		Client:  mgr.cfg.Hub_Client,
-		Key:     mgr.cfg.Hub_Key,
-		Manager: mgr.cfg.Name,
-	}
-	corpus := make(map[hash.Sig]bool)
-	for _, inp := range mgr.corpus {
-		sig := hash.Hash(inp.Prog)
-		corpus[sig] = true
-		if mgr.hubCorpus[sig] {
-			continue
-		}
-		mgr.hubCorpus[sig] = true
-		a.Add = append(a.Add, inp.Prog)
-	}
-	for sig := range mgr.hubCorpus {
-		if corpus[sig] {
-			continue
-		}
-		delete(mgr.hubCorpus, sig)
-		a.Del = append(a.Del, sig.String())
-	}
-	for {
-		a.Repros = mgr.newRepros
-
-		mgr.mu.Unlock()
-
-		if mgr.cfg.Reproduce && mgr.dash != nil {
-			needReproReply := make(chan bool)
-			mgr.needMoreRepros <- needReproReply
-			a.NeedRepros = <-needReproReply
-		}
-
-		r := new(HubSyncRes)
-		if err := mgr.hub.Call("Hub.Sync", a, r); err != nil {
-			mgr.mu.Lock()
-			Logf(0, "Hub.Sync rpc failed: %v", err)
-			mgr.hub.Close()
-			mgr.hub = nil
-			return
-		}
-
-		reproDropped := 0
-		for _, repro := range r.Repros {
-			_, err := mgr.target.Deserialize(repro)
-			if err != nil {
-				reproDropped++
-				continue
-			}
-			mgr.hubReproQueue <- &Crash{
-				vmIndex: -1,
-				hub:     true,
-				Report: &report.Report{
-					Title:  "external repro",
-					Output: repro,
-				},
-			}
-		}
-
-		mgr.mu.Lock()
-		mgr.newRepros = nil
-		dropped := 0
-		for _, inp := range r.Progs {
-			_, err := mgr.target.Deserialize(inp)
-			if err != nil {
-				dropped++
-				continue
-			}
-			mgr.candidates = append(mgr.candidates, RPCCandidate{
-				Prog:      inp,
-				Minimized: false, // don't trust programs from hub
-				Smashed:   false,
-			})
-		}
-		mgr.stats["hub add"] += uint64(len(a.Add))
-		mgr.stats["hub del"] += uint64(len(a.Del))
-		mgr.stats["hub drop"] += uint64(dropped)
-		mgr.stats["hub new"] += uint64(len(r.Progs) - dropped)
-		mgr.stats["hub sent repros"] += uint64(len(a.Repros))
-		mgr.stats["hub recv repros"] += uint64(len(r.Repros) - reproDropped)
-		Logf(0, "hub sync: send: add %v, del %v, repros %v; recv: progs: drop %v, new %v, repros: drop: %v, new %v; more %v",
-			len(a.Add), len(a.Del), len(a.Repros), dropped, len(r.Progs)-dropped, reproDropped, len(r.Repros)-reproDropped, r.More)
-		if len(r.Progs)+r.More == 0 {
-			break
-		}
-		a.Add = nil
-		a.Del = nil
-	}
+	return res
 }
 
 func (mgr *Manager) collectUsedFiles() {
+	if mgr.vmPool == nil {
+		return
+	}
 	addUsedFile := func(f string) {
 		if f == "" {
 			return
 		}
 		stat, err := os.Stat(f)
 		if err != nil {
-			Fatalf("failed to stat %v: %v", f, err)
+			log.Fatalf("failed to stat %v: %v", f, err)
 		}
 		mgr.usedFiles[f] = stat.ModTime()
 	}
@@ -1191,7 +997,9 @@ func (mgr *Manager) collectUsedFiles() {
 	addUsedFile(cfg.SyzExecprogBin)
 	addUsedFile(cfg.SyzExecutorBin)
 	addUsedFile(cfg.SSHKey)
-	addUsedFile(cfg.Vmlinux)
+	if vmlinux := filepath.Join(cfg.KernelObj, mgr.sysTarget.KernelObject); osutil.IsExist(vmlinux) {
+		addUsedFile(vmlinux)
+	}
 	if cfg.Image != "9p" {
 		addUsedFile(cfg.Image)
 	}
@@ -1201,10 +1009,14 @@ func (mgr *Manager) checkUsedFiles() {
 	for f, mod := range mgr.usedFiles {
 		stat, err := os.Stat(f)
 		if err != nil {
-			Fatalf("failed to stat %v: %v", f, err)
+			log.Fatalf("failed to stat %v: %v", f, err)
 		}
 		if mod != stat.ModTime() {
-			Fatalf("modification time of %v has changed: %v -> %v", f, mod, stat.ModTime())
+			log.Fatalf("file %v that syz-manager uses has been modified by an external program\n"+
+				"this can lead to arbitrary syz-manager misbehavior\n"+
+				"modification time has changed: %v -> %v\n"+
+				"don't modify files that syz-manager uses. exiting to prevent harm",
+				f, mod, stat.ModTime())
 		}
 	}
 }
@@ -1220,14 +1032,14 @@ func (mgr *Manager) dashboardReporter() {
 			mgr.mu.Unlock()
 			continue
 		}
-		crashes := mgr.stats["crashes"]
-		execs := mgr.stats["exec total"]
+		crashes := mgr.stats.crashes.get()
+		execs := mgr.stats.execTotal.get()
 		req := &dashapi.ManagerStatsReq{
 			Name:        mgr.cfg.Name,
 			Addr:        webAddr,
 			UpTime:      time.Since(mgr.firstConnect),
 			Corpus:      uint64(len(mgr.corpus)),
-			Cover:       uint64(mgr.corpusSignal.Len()),
+			Cover:       mgr.stats.corpusSignal.get(),
 			FuzzingTime: mgr.fuzzingTime - lastFuzzingTime,
 			Crashes:     crashes - lastCrashes,
 			Execs:       execs - lastExecs,
@@ -1235,7 +1047,7 @@ func (mgr *Manager) dashboardReporter() {
 		mgr.mu.Unlock()
 
 		if err := mgr.dash.UploadManagerStats(req); err != nil {
-			Logf(0, "faield to upload dashboard stats: %v", err)
+			log.Logf(0, "failed to upload dashboard stats: %v", err)
 			continue
 		}
 		mgr.mu.Lock()

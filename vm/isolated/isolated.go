@@ -14,19 +14,19 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 func init() {
-	vmimpl.Register("isolated", ctor)
+	vmimpl.Register("isolated", ctor, false)
 }
 
 type Config struct {
-	Targets       []string // target machines: (hostname|ip)(:port)?
-	Target_Dir    string   // directory to copy/run on target
-	Target_Reboot bool     // reboot target on repair
+	Targets      []string `json:"targets"`       // target machines: (hostname|ip)(:port)?
+	TargetDir    string   `json:"target_dir"`    // directory to copy/run on target
+	TargetReboot bool     `json:"target_reboot"` // reboot target on repair
 }
 
 type Pool struct {
@@ -35,13 +35,15 @@ type Pool struct {
 }
 
 type instance struct {
-	cfg        *Config
-	target     string
-	targetPort int
-	closed     chan bool
-	debug      bool
-	sshkey     string
-	port       int
+	cfg         *Config
+	os          string
+	targetAddr  string
+	targetPort  int
+	closed      chan bool
+	debug       bool
+	sshUser     string
+	sshKey      string
+	forwardPort int
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -52,19 +54,16 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	if len(cfg.Targets) == 0 {
 		return nil, fmt.Errorf("config param targets is empty")
 	}
-	if cfg.Target_Dir == "" {
+	if cfg.TargetDir == "" {
 		return nil, fmt.Errorf("config param target_dir is empty")
-	}
-	// sshkey is optional
-	if env.SSHKey != "" && !osutil.IsExist(env.SSHKey) {
-		return nil, fmt.Errorf("ssh key '%v' does not exist", env.SSHKey)
 	}
 	for _, target := range cfg.Targets {
 		if _, _, err := splitTargetPort(target); err != nil {
 			return nil, fmt.Errorf("bad target %q: %v", target, err)
 		}
 	}
-	if env.Debug {
+	if env.Debug && len(cfg.Targets) > 1 {
+		log.Logf(0, "limiting number of targets from %v to 1 in debug mode", len(cfg.Targets))
 		cfg.Targets = cfg.Targets[:1]
 	}
 	pool := &Pool{
@@ -79,14 +78,16 @@ func (pool *Pool) Count() int {
 }
 
 func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
-	target, targetPort, _ := splitTargetPort(pool.cfg.Targets[index])
+	targetAddr, targetPort, _ := splitTargetPort(pool.cfg.Targets[index])
 	inst := &instance{
 		cfg:        pool.cfg,
-		target:     pool.env.SSHUser + "@" + target,
+		os:         pool.env.OS,
+		targetAddr: targetAddr,
 		targetPort: targetPort,
 		closed:     make(chan bool),
 		debug:      pool.env.Debug,
-		sshkey:     pool.env.SSHKey,
+		sshUser:    pool.env.SSHUser,
+		sshKey:     pool.env.SSHKey,
 	}
 	closeInst := inst
 	defer func() {
@@ -99,46 +100,48 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 	}
 
 	// Create working dir if doesn't exist.
-	inst.ssh("mkdir -p '" + inst.cfg.Target_Dir + "'")
+	inst.ssh("mkdir -p '" + inst.cfg.TargetDir + "'")
 
 	// Remove temp files from previous runs.
-	inst.ssh("rm -rf '" + filepath.Join(inst.cfg.Target_Dir, "*") + "'")
+	inst.ssh("rm -rf '" + filepath.Join(inst.cfg.TargetDir, "*") + "'")
 
 	closeInst = nil
 	return inst, nil
 }
 
 func (inst *instance) Forward(port int) (string, error) {
-	if inst.port != 0 {
+	if inst.forwardPort != 0 {
 		return "", fmt.Errorf("isolated: Forward port already set")
 	}
 	if port == 0 {
 		return "", fmt.Errorf("isolated: Forward port is zero")
 	}
-	inst.port = port
+	inst.forwardPort = port
 	return fmt.Sprintf("127.0.0.1:%v", port), nil
 }
 
-func (inst *instance) ssh(command string) ([]byte, error) {
+func (inst *instance) ssh(command string) error {
 	if inst.debug {
-		Logf(0, "executing ssh %+v", command)
+		log.Logf(0, "executing ssh %+v", command)
 	}
 
 	rpipe, wpipe, err := osutil.LongPipe()
 	if err != nil {
-		return nil, err
+		return err
 	}
+	// TODO(dvyukov): who is closing rpipe?
 
-	args := append(inst.sshArgs("-p"), inst.target, command)
+	args := append(vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort),
+		inst.sshUser+"@"+inst.targetAddr, command)
 	if inst.debug {
-		Logf(0, "running command: ssh %#v", args)
+		log.Logf(0, "running command: ssh %#v", args)
 	}
 	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()
-		return nil, err
+		return err
 	}
 	wpipe.Close()
 
@@ -147,7 +150,7 @@ func (inst *instance) ssh(command string) ([]byte, error) {
 		select {
 		case <-time.After(time.Second * 30):
 			if inst.debug {
-				Logf(0, "ssh hanged")
+				log.Logf(0, "ssh hanged")
 			}
 			cmd.Process.Kill()
 		case <-done:
@@ -157,60 +160,47 @@ func (inst *instance) ssh(command string) ([]byte, error) {
 		close(done)
 		out, _ := ioutil.ReadAll(rpipe)
 		if inst.debug {
-			Logf(0, "ssh failed: %v\n%s", err, out)
+			log.Logf(0, "ssh failed: %v\n%s", err, out)
 		}
-		return nil, fmt.Errorf("ssh %+v failed: %v\n%s", args, err, out)
+		return fmt.Errorf("ssh %+v failed: %v\n%s", args, err, out)
 	}
 	close(done)
 	if inst.debug {
-		Logf(0, "ssh returned")
+		log.Logf(0, "ssh returned")
 	}
-	out, _ := ioutil.ReadAll(rpipe)
-	return out, nil
+	return nil
 }
 
 func (inst *instance) repair() error {
-	Logf(2, "isolated: trying to ssh")
-	if err := inst.waitForSSH(30 * 60); err == nil {
-		if inst.cfg.Target_Reboot {
-			Logf(2, "isolated: trying to reboot")
+	log.Logf(2, "isolated: trying to ssh")
+	if err := inst.waitForSSH(30 * time.Minute); err == nil {
+		if inst.cfg.TargetReboot {
+			log.Logf(2, "isolated: trying to reboot")
 			inst.ssh("reboot") // reboot will return an error, ignore it
 			if err := inst.waitForReboot(5 * 60); err != nil {
-				Logf(2, "isolated: machine did not reboot")
+				log.Logf(2, "isolated: machine did not reboot")
 				return err
 			}
-			Logf(2, "isolated: rebooted wait for comeback")
-			if err := inst.waitForSSH(30 * 60); err != nil {
-				Logf(2, "isolated: machine did not comeback")
+			log.Logf(2, "isolated: rebooted wait for comeback")
+			if err := inst.waitForSSH(30 * time.Minute); err != nil {
+				log.Logf(2, "isolated: machine did not comeback")
 				return err
 			}
-			Logf(2, "isolated: reboot succeeded")
+			log.Logf(2, "isolated: reboot succeeded")
 		} else {
-			Logf(2, "isolated: ssh succeeded")
+			log.Logf(2, "isolated: ssh succeeded")
 		}
 	} else {
-		Logf(2, "isolated: ssh failed")
+		log.Logf(2, "isolated: ssh failed")
 		return fmt.Errorf("SSH failed")
 	}
 
 	return nil
 }
 
-func (inst *instance) waitForSSH(timeout int) error {
-	var err error
-	start := time.Now()
-	for {
-		if !vmimpl.SleepInterruptible(time.Second) {
-			return fmt.Errorf("shutdown in progress")
-		}
-		if _, err = inst.ssh("pwd"); err == nil {
-			return nil
-		}
-		if time.Since(start).Seconds() > float64(timeout) {
-			break
-		}
-	}
-	return fmt.Errorf("isolated: instance is dead and unrepairable: %v", err)
+func (inst *instance) waitForSSH(timeout time.Duration) error {
+	return vmimpl.WaitForSSH(inst.debug, timeout, inst.targetAddr, inst.sshKey, inst.sshUser,
+		inst.os, inst.targetPort, nil)
 }
 
 func (inst *instance) waitForReboot(timeout int) error {
@@ -221,7 +211,7 @@ func (inst *instance) waitForReboot(timeout int) error {
 			return fmt.Errorf("shutdown in progress")
 		}
 		// If it fails, then the reboot started
-		if _, err = inst.ssh("pwd"); err != nil {
+		if err = inst.ssh("pwd"); err != nil {
 			return nil
 		}
 		if time.Since(start).Seconds() > float64(timeout) {
@@ -237,12 +227,13 @@ func (inst *instance) Close() {
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	baseName := filepath.Base(hostSrc)
-	vmDst := filepath.Join(inst.cfg.Target_Dir, baseName)
+	vmDst := filepath.Join(inst.cfg.TargetDir, baseName)
 	inst.ssh("pkill -9 '" + baseName + "'; rm -f '" + vmDst + "'")
-	args := append(inst.sshArgs("-P"), hostSrc, inst.target+":"+vmDst)
+	args := append(vmimpl.SCPArgs(inst.debug, inst.sshKey, inst.targetPort),
+		hostSrc, inst.sshUser+"@"+inst.targetAddr+":"+vmDst)
 	cmd := osutil.Command("scp", args...)
 	if inst.debug {
-		Logf(0, "running command: scp %#v", args)
+		log.Logf(0, "running command: scp %#v", args)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
 	}
@@ -265,8 +256,9 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (<-chan []byte, <-chan error, error) {
-	args := append(inst.sshArgs("-p"), inst.target)
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	<-chan []byte, <-chan error, error) {
+	args := append(vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort), inst.sshUser+"@"+inst.targetAddr)
 	dmesg, err := vmimpl.OpenRemoteConsole("ssh", args...)
 	if err != nil {
 		return nil, nil, err
@@ -278,16 +270,16 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		return nil, nil, err
 	}
 
-	args = inst.sshArgs("-p")
+	args = vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort)
 	// Forward target port as part of the ssh connection (reverse proxy)
-	if inst.port != 0 {
-		proxy := fmt.Sprintf("%v:127.0.0.1:%v", inst.port, inst.port)
+	if inst.forwardPort != 0 {
+		proxy := fmt.Sprintf("%v:127.0.0.1:%v", inst.forwardPort, inst.forwardPort)
 		args = append(args, "-R", proxy)
 	}
-	args = append(args, inst.target, "cd "+inst.cfg.Target_Dir+" && exec "+command)
-	Logf(0, "running command: ssh %#v", args)
+	args = append(args, inst.sshUser+"@"+inst.targetAddr, "cd "+inst.cfg.TargetDir+" && exec "+command)
+	log.Logf(0, "running command: ssh %#v", args)
 	if inst.debug {
-		Logf(0, "running command: ssh %#v", args)
+		log.Logf(0, "running command: ssh %#v", args)
 	}
 	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
@@ -308,63 +300,11 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	merger.Add("dmesg", dmesg)
 	merger.Add("ssh", rpipe)
 
-	errc := make(chan error, 1)
-	signal := func(err error) {
-		select {
-		case errc <- err:
-		default:
-		}
-	}
-
-	go func() {
-		select {
-		case <-time.After(timeout):
-			signal(vmimpl.ErrTimeout)
-		case <-stop:
-			signal(vmimpl.ErrTimeout)
-		case <-inst.closed:
-			if inst.debug {
-				Logf(0, "instance closed")
-			}
-			signal(fmt.Errorf("instance closed"))
-		case err := <-merger.Err:
-			cmd.Process.Kill()
-			dmesg.Close()
-			merger.Wait()
-			if cmdErr := cmd.Wait(); cmdErr == nil {
-				// If the command exited successfully, we got EOF error from merger.
-				// But in this case no error has happened and the EOF is expected.
-				err = nil
-			}
-			signal(err)
-			return
-		}
-		cmd.Process.Kill()
-		dmesg.Close()
-		merger.Wait()
-		cmd.Wait()
-	}()
-	return merger.Output, errc, nil
+	return vmimpl.Multiplex(cmd, merger, dmesg, timeout, stop, inst.closed, inst.debug)
 }
 
-func (inst *instance) sshArgs(portArg string) []string {
-	args := []string{
-		portArg, fmt.Sprint(inst.targetPort),
-		"-o", "ConnectionAttempts=10",
-		"-o", "ConnectTimeout=10",
-		"-o", "BatchMode=yes",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "IdentitiesOnly=yes",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "LogLevel=error",
-	}
-	if inst.sshkey != "" {
-		args = append(args, "-i", inst.sshkey)
-	}
-	if inst.debug {
-		args = append(args, "-v")
-	}
-	return args
+func (inst *instance) Diagnose() ([]byte, bool) {
+	return nil, false
 }
 
 func splitTargetPort(addr string) (string, int, error) {

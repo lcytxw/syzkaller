@@ -8,6 +8,7 @@ package dash
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -39,6 +40,9 @@ func TestAccessConfig(t *testing.T) {
 
 // TestAccess checks that all UIs respect access levels.
 func TestAccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
 	c := NewCtx(t)
 	defer c.Close()
 
@@ -69,14 +73,10 @@ func TestAccess(t *testing.T) {
 	// noteBugAccessLevel collects all entities associated with the extID bug.
 	noteBugAccessLevel := func(extID string, level AccessLevel) {
 		bug, _, err := findBugByReportingID(c.ctx, extID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		c.expectOK(err)
 		crash, _, err := findCrashForBug(c.ctx, bug)
-		if err != nil {
-			t.Fatal(err)
-		}
-		bugID := bugKeyHash(bug.Namespace, bug.Title, bug.Seq)
+		c.expectOK(err)
+		bugID := bug.keyHash()
 		entities = append(entities, []entity{
 			{
 				level: level,
@@ -100,8 +100,20 @@ func TestAccess(t *testing.T) {
 			},
 			{
 				level: level,
+				ref:   fmt.Sprint(crash.Log),
+				url: fmt.Sprintf("/text?tag=CrashLog&x=%v",
+					strconv.FormatUint(uint64(crash.Log), 16)),
+			},
+			{
+				level: level,
 				ref:   fmt.Sprint(crash.Report),
 				url:   fmt.Sprintf("/text?tag=CrashReport&id=%v", crash.Report),
+			},
+			{
+				level: level,
+				ref:   fmt.Sprint(crash.Report),
+				url: fmt.Sprintf("/text?tag=CrashReport&x=%v",
+					strconv.FormatUint(uint64(crash.Report), 16)),
 			},
 			{
 				level: level,
@@ -110,8 +122,20 @@ func TestAccess(t *testing.T) {
 			},
 			{
 				level: level,
+				ref:   fmt.Sprint(crash.ReproC),
+				url: fmt.Sprintf("/text?tag=ReproC&x=%v",
+					strconv.FormatUint(uint64(crash.ReproC), 16)),
+			},
+			{
+				level: level,
 				ref:   fmt.Sprint(crash.ReproSyz),
 				url:   fmt.Sprintf("/text?tag=ReproSyz&id=%v", crash.ReproSyz),
+			},
+			{
+				level: level,
+				ref:   fmt.Sprint(crash.ReproSyz),
+				url: fmt.Sprintf("/text?tag=ReproSyz&x=%v",
+					strconv.FormatUint(uint64(crash.ReproSyz), 16)),
 			},
 		}...)
 	}
@@ -119,9 +143,7 @@ func TestAccess(t *testing.T) {
 	// noteBuildccessLevel collects all entities associated with the kernel build buildID.
 	noteBuildccessLevel := func(ns, buildID string) {
 		build, err := loadBuild(c.ctx, ns, buildID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		c.expectOK(err)
 		entities = append(entities, entity{
 			level: config.Namespaces[ns].AccessLevel,
 			ref:   build.ID,
@@ -153,10 +175,10 @@ func TestAccess(t *testing.T) {
 			clientName, clientKey = k, v
 		}
 		namespaceAccessPrefix := accessLevelPrefix(config.Namespaces[ns].AccessLevel)
-		client := c.makeClient(clientName, clientKey)
+		client := c.makeClient(clientName, clientKey, true)
 		build := testBuild(1)
 		build.KernelConfig = []byte(namespaceAccessPrefix + "build")
-		client.uploadBuild(build)
+		client.UploadBuild(build)
 		noteBuildccessLevel(ns, build.ID)
 
 		for reportingIdx := 0; reportingIdx < 2; reportingIdx++ {
@@ -164,36 +186,34 @@ func TestAccess(t *testing.T) {
 			accessPrefix := accessLevelPrefix(accessLevel)
 
 			crashInvalid := testCrashWithRepro(build, reportingIdx*10+0)
-			client.reportCrash(crashInvalid)
-			repInvalid := reportAllBugs(c, 1)[0]
+			client.ReportCrash(crashInvalid)
+			repInvalid := client.pollBug()
 			if reportingIdx != 0 {
-				c.expectTrue(client.updateBug(repInvalid.ID, dashapi.BugStatusUpstream, "").OK)
-				repInvalid = reportAllBugs(c, 1)[0]
+				client.updateBug(repInvalid.ID, dashapi.BugStatusUpstream, "")
+				repInvalid = client.pollBug()
 			}
-			c.expectTrue(client.updateBug(repInvalid.ID, dashapi.BugStatusInvalid, "").OK)
+			client.updateBug(repInvalid.ID, dashapi.BugStatusInvalid, "")
 			noteBugAccessLevel(repInvalid.ID, accessLevel)
 
 			crashFixed := testCrashWithRepro(build, reportingIdx*10+0)
-			client.reportCrash(crashFixed)
-			repFixed := reportAllBugs(c, 1)[0]
+			client.ReportCrash(crashFixed)
+			repFixed := client.pollBug()
 			if reportingIdx != 0 {
-				c.expectTrue(client.updateBug(repFixed.ID, dashapi.BugStatusUpstream, "").OK)
-				repFixed = reportAllBugs(c, 1)[0]
+				client.updateBug(repFixed.ID, dashapi.BugStatusUpstream, "")
+				repFixed = client.pollBug()
 			}
-			cmd := &dashapi.BugUpdate{
+			reply, _ := client.ReportingUpdate(&dashapi.BugUpdate{
 				ID:         repFixed.ID,
 				Status:     dashapi.BugStatusOpen,
 				FixCommits: []string{ns + "-patch0"},
 				ExtID:      accessPrefix + "reporting-ext-id",
 				Link:       accessPrefix + "reporting-link",
-			}
-			reply := new(dashapi.BugUpdateReply)
-			client.expectOK(client.API("reporting_update", cmd, reply))
+			})
 			c.expectEQ(reply.OK, true)
 			buildFixing := testBuild(reportingIdx*10 + 2)
 			buildFixing.Manager = build.Manager
 			buildFixing.Commits = []string{ns + "-patch0"}
-			client.uploadBuild(buildFixing)
+			client.UploadBuild(buildFixing)
 			noteBuildccessLevel(ns, buildFixing.ID)
 			// Fixed bugs become visible up to the last reporting.
 			finalLevel := config.Namespaces[ns].
@@ -205,42 +225,40 @@ func TestAccess(t *testing.T) {
 			crashOpen.Report = []byte(accessPrefix + "report")
 			crashOpen.ReproC = []byte(accessPrefix + "repro c")
 			crashOpen.ReproSyz = []byte(accessPrefix + "repro syz")
-			client.reportCrash(crashOpen)
-			repOpen := reportAllBugs(c, 1)[0]
+			client.ReportCrash(crashOpen)
+			repOpen := client.pollBug()
 			if reportingIdx != 0 {
-				c.expectTrue(client.updateBug(repOpen.ID, dashapi.BugStatusUpstream, "").OK)
-				repOpen = reportAllBugs(c, 1)[0]
+				client.updateBug(repOpen.ID, dashapi.BugStatusUpstream, "")
+				repOpen = client.pollBug()
 			}
 			noteBugAccessLevel(repOpen.ID, accessLevel)
 
 			crashPatched := testCrashWithRepro(build, reportingIdx*10+1)
-			client.reportCrash(crashPatched)
-			repPatched := reportAllBugs(c, 1)[0]
+			client.ReportCrash(crashPatched)
+			repPatched := client.pollBug()
 			if reportingIdx != 0 {
-				c.expectTrue(client.updateBug(repPatched.ID, dashapi.BugStatusUpstream, "").OK)
-				repPatched = reportAllBugs(c, 1)[0]
+				client.updateBug(repPatched.ID, dashapi.BugStatusUpstream, "")
+				repPatched = client.pollBug()
 			}
-			cmd = &dashapi.BugUpdate{
+			reply, _ = client.ReportingUpdate(&dashapi.BugUpdate{
 				ID:         repPatched.ID,
 				Status:     dashapi.BugStatusOpen,
 				FixCommits: []string{ns + "-patch0"},
 				ExtID:      accessPrefix + "reporting-ext-id",
 				Link:       accessPrefix + "reporting-link",
-			}
-			reply = new(dashapi.BugUpdateReply)
-			client.expectOK(client.API("reporting_update", cmd, reply))
+			})
 			c.expectEQ(reply.OK, true)
 			// Patched bugs are also visible up to the last reporting.
 			noteBugAccessLevel(repPatched.ID, finalLevel)
 
 			crashDup := testCrashWithRepro(build, reportingIdx*10+2)
-			client.reportCrash(crashDup)
-			repDup := reportAllBugs(c, 1)[0]
+			client.ReportCrash(crashDup)
+			repDup := client.pollBug()
 			if reportingIdx != 0 {
-				c.expectTrue(client.updateBug(repDup.ID, dashapi.BugStatusUpstream, "").OK)
-				repDup = reportAllBugs(c, 1)[0]
+				client.updateBug(repDup.ID, dashapi.BugStatusUpstream, "")
+				repDup = client.pollBug()
 			}
-			c.expectTrue(client.updateBug(repDup.ID, dashapi.BugStatusDup, repOpen.ID).OK)
+			client.updateBug(repDup.ID, dashapi.BugStatusDup, repOpen.ID)
 			noteBugAccessLevel(repDup.ID, accessLevel)
 		}
 	}

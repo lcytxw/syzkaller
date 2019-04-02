@@ -1,27 +1,24 @@
 // Copyright 2018 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-function sortTable(colName, conv) {
-	table = event.srcElement.parentNode.parentNode.parentNode;
-	rows = table.getElementsByTagName("tr");
+function sortTable(item, colName, conv, desc = false) {
+	table = item.parentNode.parentNode.parentNode;
+	rows = table.rows;
 	col = findColumnByName(rows[0].getElementsByTagName("th"), colName);
-	values = new Array;
+	values = [];
 	for (i = 1; i < rows.length; i++)
-		values[i] = conv(rows[i].getElementsByTagName("td")[col].textContent);
-	desc = isSorted(values);
-	do {
-		changed = false;
-		for (i = 1; i < values.length - 1; i++) {
-			v0 = values[i];
-			v1 = values[i + 1];
-			if (desc && v0 >= v1 || !desc && v0 <= v1)
-				continue;
-			changed = true;
-			values[i] = v1;
-			values[i + 1] = v0;
-			rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
-		}
-	} while (changed);
+		values.push([conv(rows[i].getElementsByTagName("td")[col].textContent), rows[i]]);
+	if (desc)
+		desc = !isSorted(values.slice().reverse())
+	else
+		desc = isSorted(values);
+	values.sort(function(a, b) {
+		if (a[0] == b[0]) return 0;
+		if (desc && a[0] > b[0] || !desc && a[0] < b[0]) return -1;
+		return 1;
+	});
+	for (i = 0; i < values.length; i++)
+		table.appendChild(values[i][1]);
 	return false;
 }
 
@@ -34,8 +31,8 @@ function findColumnByName(headers, colName) {
 }
 
 function isSorted(values) {
-	for (i = 1; i < rows.length - 1; i++) {
-		if (values[i] > values[i + 1])
+	for (i = 0; i < values.length - 1; i++) {
+		if (values[i][0] > values[i + 1][0])
 			return false;
 	}
 	return true;
@@ -43,6 +40,8 @@ function isSorted(values) {
 
 function textSort(v) { return v.toLowerCase(); }
 function numSort(v) { return -parseInt(v); }
+function floatSort(v) { return -parseFloat(v); }
+function yesSort(v) { return v == "yes" ? 0 : 1; }
 function reproSort(v) { return v == "C" ? 0 : v == "syz" ? 1 : 2; }
 function patchedSort(v) { return v == "" ? -1 : parseInt(v); }
 
@@ -61,27 +60,4 @@ function timeSort(v) {
 	if (d > 0)
 		return parseInt(v) * 60 * 24;
 	return 1000000000;
-}
-
-function dateSort(v) {
-	if (v == "")
-		return 0;
-	switch (v.substring(0, 3)) {
-	case "Jan": w = 0; break;
-	case "Feb": w = 1; break;
-	case "Mar": w = 2; break;
-	case "Apr": w = 3; break;
-	case "May": w = 4; break;
-	case "Jun": w = 5; break;
-	case "Jul": w = 6; break;
-	case "Aug": w = 7; break;
-	case "Sep": w = 8; break;
-	case "Oct": w = 9; break;
-	case "Nov": w = 10; break;
-	case "Dec": w = 11; break;
-	}
-	w = w * 100 + parseInt(v.substring(4, 6));
-	w = w * 100 + parseInt(v.substring(7, 9));
-	w = w * 100 + parseInt(v.substring(10, 12));
-	return -w;
 }

@@ -12,11 +12,13 @@ import (
 	"testing"
 )
 
+type uint64Set map[uint64]bool
+
 type ConstArgTest struct {
 	name  string
 	in    uint64
 	comps CompMap
-	res   uint64Set
+	res   []uint64
 }
 
 type DataArgTest struct {
@@ -34,8 +36,8 @@ func TestHintsCheckConstArg(t *testing.T) {
 		{
 			"One replacer test",
 			0xdeadbeef,
-			CompMap{0xdeadbeef: uint64Set{0xcafebabe: true}},
-			uint64Set{0xcafebabe: true},
+			CompMap{0xdeadbeef: uint64Set{0xdeadbeef: true, 0xcafebabe: true}},
+			[]uint64{0xcafebabe},
 		},
 		// Test for cases when there's multiple comparisons (op1, op2), (op1, op3), ...
 		// Checks that for every such operand a program is generated.
@@ -43,22 +45,22 @@ func TestHintsCheckConstArg(t *testing.T) {
 			"Multiple replacers test",
 			0xabcd,
 			CompMap{0xabcd: uint64Set{0x2: true, 0x3: true}},
-			uint64Set{0x2: true, 0x3: true},
+			[]uint64{0x2, 0x3},
 		},
 		// Checks that special ints are not used.
 		{
 			"Special ints test",
 			0xabcd,
 			CompMap{0xabcd: uint64Set{0x1: true, 0x2: true}},
-			uint64Set{0x2: true},
+			[]uint64{0x2},
 		},
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
-			res := uint64Set{}
+			var res []uint64
 			constArg := &ConstArg{ArgCommon{nil}, test.in}
 			checkConstArg(constArg, test.comps, func() {
-				res[constArg.Val] = true
+				res = append(res, constArg.Val)
 			})
 			if !reflect.DeepEqual(res, test.res) {
 				t.Fatalf("\ngot : %v\nwant: %v", res, test.res)
@@ -76,7 +78,11 @@ func TestHintsCheckDataArg(t *testing.T) {
 		{
 			"One replacer test",
 			"\xef\xbe\xad\xde",
-			CompMap{0xdeadbeef: uint64Set{0xcafebabe: true}},
+			CompMap{
+				0xdeadbeef: uint64Set{0xcafebabe: true, 0xdeadbeef: true},
+				0xbeef:     uint64Set{0xbeef: true},
+				0xef:       uint64Set{0xef: true},
+			},
 			map[string]bool{
 				"\xbe\xba\xfe\xca": true,
 			},
@@ -155,6 +161,35 @@ func TestHintsCheckDataArg(t *testing.T) {
 				"\xab\x44\x44\x44\x44\x44\x44\x44\x44": true,
 			},
 		},
+		{
+			"Replace in the middle of a larger blob",
+			"\xef\xcd\xab\x90\x78\x56\x34\x12",
+			CompMap{0xffffffffffff90ab: uint64Set{0xffffffffffffaabb: true}},
+			map[string]bool{
+				"\xef\xcd\xbb\xaa\x78\x56\x34\x12": true,
+			},
+		},
+		{
+
+			"Big-endian replace",
+			"\xef\xcd\xab\x90\x78\x56\x34\x12",
+			CompMap{
+				// 0xff07 is reversed special int.
+				0xefcd:             uint64Set{0xaabb: true, 0xff07: true},
+				0x3412:             uint64Set{0xaabb: true, 0xff07: true},
+				0x9078:             uint64Set{0xaabb: true, 0x11223344: true, 0xff07: true},
+				0x90785634:         uint64Set{0xaabbccdd: true, 0x11223344: true},
+				0xefcdab9078563412: uint64Set{0x1122334455667788: true},
+			},
+			map[string]bool{
+				"\xaa\xbb\xab\x90\x78\x56\x34\x12": true,
+				"\xef\xcd\xab\x90\x78\x56\xaa\xbb": true,
+				"\xef\xcd\xab\xaa\xbb\x56\x34\x12": true,
+				"\xef\xcd\xab\xaa\xbb\xcc\xdd\x12": true,
+				"\xef\xcd\xab\x11\x22\x33\x44\x12": true,
+				"\x11\x22\x33\x44\x55\x66\x77\x88": true,
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
@@ -167,7 +202,7 @@ func TestHintsCheckDataArg(t *testing.T) {
 				res[string(dataArg.Data())] = true
 			})
 			if !reflect.DeepEqual(res, test.res) {
-				s := "\ngot: ["
+				s := "\ngot:  ["
 				for x := range res {
 					s += fmt.Sprintf("0x%x, ", x)
 				}
@@ -205,15 +240,15 @@ func TestHintsShrinkExpand(t *testing.T) {
 				0x34:   uint64Set{0xab: true},
 				0x1234: uint64Set{0xcdcd: true},
 			},
-			uint64Set{0x12ab: true, 0xcdcd: true},
+			[]uint64{0x12ab, 0xcdcd},
 		},
 		{
 			// Models the following code:
 			// void f(u32 dw) {
 			//		u8 b = (u8) dw
 			//		i16 w = (i16) dw
-			//		if (a == 0xab) {...}
-			//		if (b == 0xcdcd) {...}
+			//		if (b == 0xab) {...}
+			//		if (w == 0xcdcd) {...}
 			//		if (dw == 0xefefefef) {...}
 			//  }; f(0x12345678);
 			"Shrink 32 test",
@@ -223,7 +258,7 @@ func TestHintsShrinkExpand(t *testing.T) {
 				0x5678:     uint64Set{0xcdcd: true},
 				0x12345678: uint64Set{0xefefefef: true},
 			},
-			uint64Set{0x123456ab: true, 0x1234cdcd: true, 0xefefefef: true},
+			[]uint64{0x123456ab, 0x1234cdcd, 0xefefefef},
 		},
 		{
 			// Models the following code:
@@ -231,24 +266,24 @@ func TestHintsShrinkExpand(t *testing.T) {
 			//		u8 b = (u8) qw
 			//		u16 w = (u16) qw
 			//		u32 dw = (u32) qw
-			//		if (a == 0xab) {...}
-			//		if (b == 0xcdcd) {...}
+			//		if (b == 0xab) {...}
+			//		if (w == 0xcdcd) {...}
 			//		if (dw == 0xefefefef) {...}
 			//		if (qw == 0x0101010101010101) {...}
 			//  }; f(0x1234567890abcdef);
 			"Shrink 64 test",
 			0x1234567890abcdef,
 			CompMap{
-				0xef:               uint64Set{0xab: true},
+				0xef:               uint64Set{0xab: true, 0xef: true},
 				0xcdef:             uint64Set{0xcdcd: true},
 				0x90abcdef:         uint64Set{0xefefefef: true},
 				0x1234567890abcdef: uint64Set{0x0101010101010101: true},
 			},
-			uint64Set{
-				0x1234567890abcdab: true,
-				0x1234567890abcdcd: true,
-				0x12345678efefefef: true,
-				0x0101010101010101: true,
+			[]uint64{
+				0x0101010101010101,
+				0x1234567890abcdab,
+				0x1234567890abcdcd,
+				0x12345678efefefef,
 			},
 		},
 		{
@@ -279,7 +314,7 @@ func TestHintsShrinkExpand(t *testing.T) {
 			"Shrink with a wider replacer test2",
 			0x1234,
 			CompMap{0x34: uint64Set{0xfffffffffffffffd: true}},
-			uint64Set{0x12fd: true},
+			[]uint64{0x12fd},
 		},
 		// -----------------------------------------------------------------
 		// Extend tests:
@@ -294,7 +329,7 @@ func TestHintsShrinkExpand(t *testing.T) {
 			"Extend 8 test",
 			0xff,
 			CompMap{0xffffffffffffffff: uint64Set{0xfffffffffffffffe: true}},
-			uint64Set{0xfe: true},
+			[]uint64{0xfe},
 		},
 		{
 			// Models the following code:
@@ -305,7 +340,7 @@ func TestHintsShrinkExpand(t *testing.T) {
 			"Extend 16 test",
 			0xffff,
 			CompMap{0xffffffffffffffff: uint64Set{0xfffffffffffffffe: true}},
-			uint64Set{0xfffe: true},
+			[]uint64{0xfffe},
 		},
 		{
 			// Models the following code:
@@ -316,7 +351,7 @@ func TestHintsShrinkExpand(t *testing.T) {
 			"Extend 32 test",
 			0xffffffff,
 			CompMap{0xffffffffffffffff: uint64Set{0xfffffffffffffffe: true}},
-			uint64Set{0xfffffffe: true},
+			[]uint64{0xfffffffe},
 		},
 		{
 			// Models the following code:
@@ -394,6 +429,7 @@ func extractValues(c *Call) map[uint64]bool {
 			}
 		}
 	})
+	delete(vals, 0) // replacing 0 can yield too many condidates
 	return vals
 }
 
@@ -411,7 +447,7 @@ func TestHintsData(t *testing.T) {
 			out:   []string{"0810000000131415"},
 		},
 	}
-	call := target.SyscallMap["syz_test$hint_data"]
+	call := target.SyscallMap["test$hint_data"]
 	for _, test := range tests {
 		input, err := hex.DecodeString(test.in)
 		if err != nil {
@@ -437,7 +473,7 @@ func TestHintsData(t *testing.T) {
 		sort.Strings(test.out)
 		sort.Strings(got)
 		if !reflect.DeepEqual(got, test.out) {
-			t.Fatalf("comps: %s\ninput: %v\ngot : %+v\nwant: %+v",
+			t.Fatalf("comps: %v\ninput: %v\ngot : %+v\nwant: %+v",
 				test.comps, test.in, got, test.out)
 		}
 	}

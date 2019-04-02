@@ -2,7 +2,7 @@
 
 The operation of the syzkaller `syz-manager` process is governed by a configuration file, passed at
 invocation time with the `-config` option.  This configuration can be based on the
-[example](/syz-manager/mgrconfig/testdata/qemu.cfg); the file is in JSON format with the
+[example](/pkg/mgrconfig/testdata/qemu.cfg); the file is in JSON format with the
 following keys in its top-level object:
 
  - `http`: URL that will display information about the running `syz-manager` process.
@@ -15,17 +15,16 @@ following keys in its top-level object:
  - `syzkaller`: Location of the `syzkaller` checkout, `syz-manager` will look
    for binaries in `bin` subdir (does not have to be `syzkaller` checkout as
    long as it preserves `bin` dir structure)
- - `vmlinux`: Location of the `vmlinux` file that corresponds to the kernel being tested
+ - `kernel_obj`: Directory with object files (e.g. `vmlinux` for linux)
    (used for report symbolization and coverage reports, optional).
  - `procs`: Number of parallel test processes in each VM (4 or 8 would be a reasonable number).
- - `leak`: Detect memory leaks with kmemleak.
  - `image`: Location of the disk image file for the QEMU instance; a copy of this file is passed as the
    `-hda` option to `qemu-system-x86_64`.
  - `sshkey`: Location (on the host machine) of a root SSH identity to use for communicating with
    the virtual machine.
  - `sandbox` : Sandboxing mode, the following modes are supported:
-     - "none": don't do anything special (has false positives, e.g. due to killing init)
-     - "setuid": impersonate into user nobody (65534), default
+     - "none": don't do anything special (has false positives, e.g. due to killing init), default
+     - "setuid": impersonate into user nobody (65534)
      - "namespace": use namespaces to drop privileges
        (requires a kernel built with `CONFIG_NAMESPACES`, `CONFIG_UTS_NS`,
        `CONFIG_USER_NS`, `CONFIG_PID_NS` and `CONFIG_NET_NS`)
@@ -41,4 +40,6 @@ following keys in its top-level object:
      - `cpu`: Number of CPUs to simulate in the VM (*not currently used*).
      - `mem`: Amount of memory (in MiB) for the VM; this is passed as the `-m` option to `qemu-system-x86_64`.
 
-See also [config.go](/syz-manager/mgrconfig/mgrconfig.go) for all config parameters.
+See also:
+ - [config.go](/pkg/mgrconfig/mgrconfig.go) for all config parameters;
+ - [qemu.go](/vm/qemu/qemu.go) for all vm parameters.

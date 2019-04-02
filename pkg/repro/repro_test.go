@@ -5,6 +5,7 @@ package repro
 
 import (
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 
@@ -17,14 +18,19 @@ func initTest(t *testing.T) (*rand.Rand, int) {
 	if testing.Short() {
 		iters = 100
 	}
-	seed := int64(time.Now().UnixNano())
+	seed := time.Now().UnixNano()
+	if os.Getenv("TRAVIS") != "" {
+		seed = 0 // required for deterministic coverage reports
+	}
 	rs := rand.NewSource(seed)
 	t.Logf("seed=%v", seed)
 	return rand.New(rs), iters
 }
 
 func TestBisect(t *testing.T) {
-	ctx := &context{}
+	ctx := &context{
+		stats: new(Stats),
+	}
 
 	rd, iters := initTest(t)
 	for n := 0; n < iters; n++ {
@@ -67,20 +73,22 @@ func TestBisect(t *testing.T) {
 
 func TestSimplifies(t *testing.T) {
 	opts := csource.Options{
-		Threaded:   true,
-		Collide:    true,
-		Repeat:     true,
-		Procs:      10,
-		Sandbox:    "namespace",
-		EnableTun:  true,
-		UseTmpDir:  true,
-		HandleSegv: true,
-		WaitRepeat: true,
-		Repro:      true,
+		Threaded:       true,
+		Collide:        true,
+		Repeat:         true,
+		Procs:          10,
+		Sandbox:        "namespace",
+		EnableTun:      true,
+		EnableNetDev:   true,
+		EnableNetReset: true,
+		EnableCgroups:  true,
+		UseTmpDir:      true,
+		HandleSegv:     true,
+		Repro:          true,
 	}
 	var check func(opts csource.Options, i int)
 	check = func(opts csource.Options, i int) {
-		if err := opts.Check(); err != nil {
+		if err := opts.Check("linux"); err != nil {
 			t.Fatalf("opts are invalid: %v", err)
 		}
 		if i == len(cSimplifies) {

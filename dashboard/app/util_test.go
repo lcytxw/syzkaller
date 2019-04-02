@@ -24,11 +24,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"golang.org/x/net/context"
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/aetest"
-	"google.golang.org/appengine/datastore"
+	db "google.golang.org/appengine/datastore"
 	aemail "google.golang.org/appengine/mail"
 	"google.golang.org/appengine/user"
 )
@@ -39,6 +40,8 @@ type Ctx struct {
 	ctx        context.Context
 	mockedTime time.Time
 	emailSink  chan *aemail.Message
+	client     *apiClient
+	client2    *apiClient
 }
 
 func NewCtx(t *testing.T) *Ctx {
@@ -62,6 +65,8 @@ func NewCtx(t *testing.T) *Ctx {
 		mockedTime: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
 		emailSink:  make(chan *aemail.Message, 100),
 	}
+	c.client = c.makeClient(client1, key1, true)
+	c.client2 = c.makeClient(client2, key2, true)
 	registerContext(r, c)
 	return c
 }
@@ -92,8 +97,14 @@ func (c *Ctx) expectForbidden(err error) {
 }
 
 func (c *Ctx) expectEQ(got, want interface{}) {
-	if !reflect.DeepEqual(got, want) {
-		c.t.Fatalf("\n%v: got %#v, want %#v", caller(0), got, want)
+	if diff := cmp.Diff(got, want); diff != "" {
+		c.t.Fatalf("\n%v: %v", caller(0), diff)
+	}
+}
+
+func (c *Ctx) expectNE(got, want interface{}) {
+	if reflect.DeepEqual(got, want) {
+		c.t.Fatalf("\n%v: equal: %#v", caller(0), got)
 	}
 }
 
@@ -104,8 +115,25 @@ func (c *Ctx) expectTrue(v bool) {
 }
 
 func caller(skip int) string {
-	_, file, line, _ := runtime.Caller(skip + 2)
-	return fmt.Sprintf("%v:%v", filepath.Base(file), line)
+	pcs := make([]uintptr, 10)
+	n := runtime.Callers(skip+3, pcs)
+	pcs = pcs[:n]
+	frames := runtime.CallersFrames(pcs)
+	stack := ""
+	for {
+		frame, more := frames.Next()
+		if strings.HasPrefix(frame.Function, "testing.") {
+			break
+		}
+		stack = fmt.Sprintf("%v:%v\n", filepath.Base(frame.File), frame.Line) + stack
+		if !more {
+			break
+		}
+	}
+	if stack != "" {
+		stack = stack[:len(stack)-1]
+	}
+	return stack
 }
 
 func (c *Ctx) Close() {
@@ -113,13 +141,14 @@ func (c *Ctx) Close() {
 		// Ensure that we can render main page and all bugs in the final test state.
 		c.expectOK(c.GET("/"))
 		var bugs []*Bug
-		keys, err := datastore.NewQuery("Bug").GetAll(c.ctx, &bugs)
+		keys, err := db.NewQuery("Bug").GetAll(c.ctx, &bugs)
 		if err != nil {
 			c.t.Errorf("ERROR: failed to query bugs: %v", err)
 		}
 		for _, key := range keys {
 			c.expectOK(c.GET(fmt.Sprintf("/bug?id=%v", key.StringID())))
 		}
+		// No pending emails (tests need to consume them).
 		c.expectOK(c.GET("/email_poll"))
 		for len(c.emailSink) != 0 {
 			c.t.Errorf("ERROR: leftover email: %v", (<-c.emailSink).Body)
@@ -131,35 +160,6 @@ func (c *Ctx) Close() {
 
 func (c *Ctx) advanceTime(d time.Duration) {
 	c.mockedTime = c.mockedTime.Add(d)
-}
-
-// API makes an api request to the app from the specified client.
-func (c *Ctx) API(client, key, method string, req, reply interface{}) error {
-	doer := func(r *http.Request) (*http.Response, error) {
-		registerContext(r, c)
-		w := httptest.NewRecorder()
-		http.DefaultServeMux.ServeHTTP(w, r)
-		// Later versions of Go have a nice w.Result method,
-		// but we stuck on 1.6 on appengine.
-		if w.Body == nil {
-			w.Body = new(bytes.Buffer)
-		}
-		res := &http.Response{
-			StatusCode: w.Code,
-			Status:     http.StatusText(w.Code),
-			Body:       ioutil.NopCloser(bytes.NewReader(w.Body.Bytes())),
-		}
-		return res, nil
-	}
-
-	c.t.Logf("API(%v): %#v", method, req)
-	err := dashapi.Query(client, "", key, method, c.inst.NewRequest, doer, req, reply)
-	if err != nil {
-		c.t.Logf("ERROR: %v", err)
-		return err
-	}
-	c.t.Logf("REPLY: %#v", reply)
-	return nil
 }
 
 // GET sends admin-authorized HTTP GET request to the app.
@@ -214,41 +214,127 @@ func (err HttpError) Error() string {
 	return fmt.Sprintf("%v: %v", err.Code, err.Body)
 }
 
+func (c *Ctx) loadBug(extID string) (*Bug, *Crash, *Build) {
+	bug, _, err := findBugByReportingID(c.ctx, extID)
+	if err != nil {
+		c.t.Fatalf("failed to load bug: %v", err)
+	}
+	return c.loadBugInfo(bug)
+}
+
+func (c *Ctx) loadBugByHash(hash string) (*Bug, *Crash, *Build) {
+	bug := new(Bug)
+	bugKey := db.NewKey(c.ctx, "Bug", hash, 0, nil)
+	c.expectOK(db.Get(c.ctx, bugKey, bug))
+	return c.loadBugInfo(bug)
+}
+
+func (c *Ctx) loadBugInfo(bug *Bug) (*Bug, *Crash, *Build) {
+	crash, _, err := findCrashForBug(c.ctx, bug)
+	if err != nil {
+		c.t.Fatalf("failed to load crash: %v", err)
+	}
+	build := c.loadBuild(bug.Namespace, crash.BuildID)
+	return bug, crash, build
+}
+
+func (c *Ctx) loadJob(extID string) (*Job, *Build, *Crash) {
+	jobKey, err := jobID2Key(c.ctx, extID)
+	if err != nil {
+		c.t.Fatalf("failed to create job key: %v", err)
+	}
+	job := new(Job)
+	if err := db.Get(c.ctx, jobKey, job); err != nil {
+		c.t.Fatalf("failed to get job %v: %v", extID, err)
+	}
+	build := c.loadBuild(job.Namespace, job.BuildID)
+	crash := new(Crash)
+	crashKey := db.NewKey(c.ctx, "Crash", "", job.CrashID, jobKey.Parent())
+	if err := db.Get(c.ctx, crashKey, crash); err != nil {
+		c.t.Fatalf("failed to load crash for job: %v", err)
+	}
+	return job, build, crash
+}
+
+func (c *Ctx) loadBuild(ns, id string) *Build {
+	build, err := loadBuild(c.ctx, ns, id)
+	c.expectOK(err)
+	return build
+}
+
+func (c *Ctx) loadManager(ns, name string) (*Manager, *Build) {
+	mgr, err := loadManager(c.ctx, ns, name)
+	c.expectOK(err)
+	build := c.loadBuild(ns, mgr.CurrentBuild)
+	return mgr, build
+}
+
+func (c *Ctx) checkURLContents(url string, want []byte) {
+	got, err := c.AuthGET(AccessAdmin, url)
+	if err != nil {
+		c.t.Fatalf("\n%v: %v request failed: %v", caller(0), url, err)
+	}
+	if !bytes.Equal(got, want) {
+		c.t.Fatalf("\n%v: url %v: got:\n%s\nwant:\n%s\n", caller(0), url, got, want)
+	}
+}
+
+func (c *Ctx) pollEmailBug() *aemail.Message {
+	c.expectOK(c.GET("/email_poll"))
+	if len(c.emailSink) == 0 {
+		c.t.Fatalf("\n%v: got no emails", caller(0))
+	}
+	return <-c.emailSink
+}
+
+func (c *Ctx) expectNoEmail() {
+	c.expectOK(c.GET("/email_poll"))
+	if len(c.emailSink) != 0 {
+		msg := <-c.emailSink
+		c.t.Fatalf("\n%v: got unexpected email: %v\n%s", caller(0), msg.Subject, msg.Body)
+	}
+}
+
 type apiClient struct {
 	*Ctx
-	client string
-	key    string
+	*dashapi.Dashboard
 }
 
-func (c *Ctx) makeClient(client, key string) *apiClient {
+func (c *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
+	doer := func(r *http.Request) (*http.Response, error) {
+		registerContext(r, c)
+		w := httptest.NewRecorder()
+		http.DefaultServeMux.ServeHTTP(w, r)
+		// Later versions of Go have a nice w.Result method,
+		// but we stuck on 1.6 on appengine.
+		if w.Body == nil {
+			w.Body = new(bytes.Buffer)
+		}
+		res := &http.Response{
+			StatusCode: w.Code,
+			Status:     http.StatusText(w.Code),
+			Body:       ioutil.NopCloser(bytes.NewReader(w.Body.Bytes())),
+		}
+		return res, nil
+	}
+	logger := func(msg string, args ...interface{}) {
+		c.t.Logf("%v: "+msg, append([]interface{}{caller(3)}, args...)...)
+	}
+	errorHandler := func(err error) {
+		if failOnErrors {
+			c.t.Fatalf("\n%v: %v", caller(2), err)
+		}
+	}
 	return &apiClient{
-		Ctx:    c,
-		client: client,
-		key:    key,
+		Ctx:       c,
+		Dashboard: dashapi.NewCustom(client, "", key, c.inst.NewRequest, doer, logger, errorHandler),
 	}
 }
 
-func (client *apiClient) API(method string, req, reply interface{}) error {
-	return client.Ctx.API(client.client, client.key, method, req, reply)
-}
-
-func (client *apiClient) uploadBuild(build *dashapi.Build) {
-	client.expectOK(client.API("upload_build", build, nil))
-}
-
-func (client *apiClient) reportCrash(crash *dashapi.Crash) {
-	client.expectOK(client.API("report_crash", crash, nil))
-}
-
-// TODO(dvyukov): make this apiClient method.
-func reportAllBugs(c *Ctx, expect int) []*dashapi.BugReport {
-	pr := &dashapi.PollBugsRequest{
-		Type: "test",
-	}
-	resp := new(dashapi.PollBugsResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, resp))
+func (client *apiClient) pollBugs(expect int) []*dashapi.BugReport {
+	resp, _ := client.ReportingPollBugs("test")
 	if len(resp.Reports) != expect {
-		c.t.Fatalf("\n%v: want %v reports, got %v", caller(0), expect, len(resp.Reports))
+		client.t.Fatalf("\n%v: want %v reports, got %v", caller(0), expect, len(resp.Reports))
 	}
 	for _, rep := range resp.Reports {
 		reproLevel := dashapi.ReproLevelNone
@@ -257,28 +343,62 @@ func reportAllBugs(c *Ctx, expect int) []*dashapi.BugReport {
 		} else if len(rep.ReproSyz) != 0 {
 			reproLevel = dashapi.ReproLevelSyz
 		}
-		cmd := &dashapi.BugUpdate{
+		reply, _ := client.ReportingUpdate(&dashapi.BugUpdate{
 			ID:         rep.ID,
+			JobID:      rep.JobID,
 			Status:     dashapi.BugStatusOpen,
 			ReproLevel: reproLevel,
-		}
-		reply := new(dashapi.BugUpdateReply)
-		c.expectOK(c.API(client1, key1, "reporting_update", cmd, reply))
-		c.expectEQ(reply.Error, false)
-		c.expectEQ(reply.OK, true)
+			CrashID:    rep.CrashID,
+		})
+		client.expectEQ(reply.Error, false)
+		client.expectEQ(reply.OK, true)
 	}
 	return resp.Reports
 }
 
-func (client *apiClient) updateBug(extID string, status dashapi.BugStatus, dup string) *dashapi.BugUpdateReply {
-	cmd := &dashapi.BugUpdate{
+func (client *apiClient) pollBug() *dashapi.BugReport {
+	return client.pollBugs(1)[0]
+}
+
+func (client *apiClient) pollNotifs(expect int) []*dashapi.BugNotification {
+	resp, _ := client.ReportingPollNotifications("test")
+	if len(resp.Notifications) != expect {
+		client.t.Fatalf("\n%v: want %v notifs, got %v", caller(0), expect, len(resp.Notifications))
+	}
+	return resp.Notifications
+}
+
+func (client *apiClient) pollNotif() *dashapi.BugNotification {
+	return client.pollNotifs(1)[0]
+}
+
+func (client *apiClient) updateBug(extID string, status dashapi.BugStatus, dup string) {
+	reply, _ := client.ReportingUpdate(&dashapi.BugUpdate{
 		ID:     extID,
 		Status: status,
 		DupOf:  dup,
+	})
+	client.expectTrue(reply.OK)
+}
+
+func (client *apiClient) pollJobs(manager string) *dashapi.JobPollResp {
+	resp, err := client.JobPoll(&dashapi.JobPollReq{
+		PatchTestManagers: []string{manager},
+		BisectManagers:    []string{manager},
+	})
+	client.expectOK(err)
+	return resp
+}
+
+func (client *apiClient) pollAndFailBisectJob(manager string) {
+	resp := client.pollJobs(manager)
+	client.expectNE(resp.ID, "")
+	client.expectEQ(resp.Type, dashapi.JobBisectCause)
+	done := &dashapi.JobDoneReq{
+		ID:    resp.ID,
+		Error: []byte("pollAndFailBisectJob"),
 	}
-	reply := new(dashapi.BugUpdateReply)
-	client.expectOK(client.API("reporting_update", cmd, reply))
-	return reply
+	client.expectOK(client.JobDone(done))
 }
 
 type (
@@ -290,7 +410,7 @@ type (
 func (c *Ctx) incomingEmail(to, body string, opts ...interface{}) {
 	id := 0
 	from := "default@sender.com"
-	cc := []string{"test@syzkaller.com", "bugs@syzkaller.com"}
+	cc := []string{"test@syzkaller.com", "bugs@syzkaller.com", "bugs2@syzkaller.com"}
 	for _, o := range opts {
 		switch opt := o.(type) {
 		case EmailOptMessageID:
@@ -315,7 +435,7 @@ Content-Type: text/plain
 	c.expectOK(c.POST("/_ah/mail/", email))
 }
 
-func init() {
+func initMocks() {
 	// Mock time as some functionality relies on real time.
 	timeNow = func(c context.Context) time.Time {
 		return getRequestContext(c).mockedTime

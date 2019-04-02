@@ -16,7 +16,7 @@ type state struct {
 	target    *Target
 	ct        *ChoiceTable
 	files     map[string]bool
-	resources map[string][]Arg
+	resources map[string][]*ResultArg
 	strings   map[string]bool
 	ma        *memAlloc
 	va        *vmaAlloc
@@ -40,7 +40,7 @@ func newState(target *Target, ct *ChoiceTable) *state {
 		target:    target,
 		ct:        ct,
 		files:     make(map[string]bool),
-		resources: make(map[string][]Arg),
+		resources: make(map[string][]*ResultArg),
 		strings:   make(map[string]bool),
 		ma:        newMemAlloc(target.NumPages * target.PageSize),
 		va:        newVmaAlloc(target.NumPages),
@@ -57,17 +57,18 @@ func (s *state) analyzeImpl(c *Call, resources bool) {
 		switch a := arg.(type) {
 		case *PointerArg:
 			switch {
-			case a.IsNull():
+			case a.IsSpecial():
 			case a.VmaSize != 0:
 				s.va.noteAlloc(a.Address/s.target.PageSize, a.VmaSize/s.target.PageSize)
-			default:
+			case a.Res != nil:
 				s.ma.noteAlloc(a.Address, a.Res.Size())
 			}
 		}
 		switch typ := arg.Type().(type) {
 		case *ResourceType:
+			a := arg.(*ResultArg)
 			if resources && typ.Dir() != DirIn {
-				s.resources[typ.Desc.Name] = append(s.resources[typ.Desc.Name], arg)
+				s.resources[typ.Desc.Name] = append(s.resources[typ.Desc.Name], a)
 				// TODO: negative PIDs and add them as well (that's process groups).
 			}
 		case *BufferType:
@@ -82,6 +83,13 @@ func (s *state) analyzeImpl(c *Call, resources bool) {
 				case BufferString:
 					s.strings[val] = true
 				case BufferFilename:
+					if len(val) < 3 || escapingFilename(val) {
+						// This is not our file, probalby one of specialFiles.
+						return
+					}
+					if val[len(val)-1] == 0 {
+						val = val[:len(val)-1]
+					}
 					s.files[val] = true
 				}
 			}
@@ -161,4 +169,139 @@ func RequiredFeatures(p *Prog) (bitmasks, csums bool) {
 		})
 	}
 	return
+}
+
+type CallFlags int
+
+const (
+	CallExecuted CallFlags = 1 << iota // was started at all
+	CallFinished                       // finished executing (rather than blocked forever)
+	CallBlocked                        // finished but blocked during execution
+)
+
+type CallInfo struct {
+	Flags  CallFlags
+	Errno  int
+	Signal []uint32
+}
+
+const (
+	fallbackSignalErrno = iota
+	fallbackSignalErrnoBlocked
+	fallbackSignalCtor
+	fallbackSignalFlags
+	fallbackCallMask = 0x1fff
+)
+
+func (p *Prog) FallbackSignal(info []CallInfo) {
+	resources := make(map[*ResultArg]*Call)
+	for i, c := range p.Calls {
+		inf := &info[i]
+		if inf.Flags&CallExecuted == 0 {
+			continue
+		}
+		id := c.Meta.ID
+		typ := fallbackSignalErrno
+		if inf.Flags&CallFinished != 0 && inf.Flags&CallBlocked != 0 {
+			typ = fallbackSignalErrnoBlocked
+		}
+		inf.Signal = append(inf.Signal, encodeFallbackSignal(typ, id, inf.Errno))
+		if inf.Errno != 0 {
+			continue
+		}
+		if c.Meta.CallName == "seccomp" {
+			// seccomp filter can produce arbitrary errno values for subsequent syscalls. Don't trust anything afterwards.
+			break
+		}
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			if a, ok := arg.(*ResultArg); ok {
+				resources[a] = c
+			}
+		})
+		// Specifically look only at top-level arguments,
+		// deeper arguments can produce too much false signal.
+		flags := 0
+		for _, arg := range c.Args {
+			flags = extractArgSignal(arg, id, flags, inf, resources)
+		}
+		if flags != 0 {
+			inf.Signal = append(inf.Signal,
+				encodeFallbackSignal(fallbackSignalFlags, id, flags))
+		}
+	}
+}
+
+func extractArgSignal(arg Arg, callID, flags int, inf *CallInfo, resources map[*ResultArg]*Call) int {
+	switch a := arg.(type) {
+	case *ResultArg:
+		flags <<= 1
+		if a.Res != nil {
+			ctor := resources[a.Res]
+			if ctor != nil {
+				inf.Signal = append(inf.Signal,
+					encodeFallbackSignal(fallbackSignalCtor, callID, ctor.Meta.ID))
+			}
+		} else {
+			if a.Val != a.Type().(*ResourceType).SpecialValues()[0] {
+				flags |= 1
+			}
+		}
+	case *ConstArg:
+		const width = 3
+		flags <<= width
+		switch typ := a.Type().(type) {
+		case *FlagsType:
+			if typ.BitMask {
+				for i, v := range typ.Vals {
+					if a.Val&v != 0 {
+						flags ^= 1 << (uint(i) % width)
+					}
+				}
+			} else {
+				for i, v := range typ.Vals {
+					if a.Val == v {
+						flags |= i % (1 << width)
+						break
+					}
+				}
+			}
+		case *LenType:
+			flags <<= 1
+			if a.Val == 0 {
+				flags |= 1
+			}
+		}
+	case *PointerArg:
+		flags <<= 1
+		if a.IsSpecial() {
+			flags |= 1
+		}
+	}
+	return flags
+}
+
+func DecodeFallbackSignal(s uint32) (callID, errno int) {
+	typ, id, aux := decodeFallbackSignal(s)
+	switch typ {
+	case fallbackSignalErrno, fallbackSignalErrnoBlocked:
+		return id, aux
+	case fallbackSignalCtor, fallbackSignalFlags:
+		return id, 0
+	default:
+		panic(fmt.Sprintf("bad fallback signal type %v", typ))
+	}
+}
+
+func encodeFallbackSignal(typ, id, aux int) uint32 {
+	if typ & ^7 != 0 {
+		panic(fmt.Sprintf("bad fallback signal type %v", typ))
+	}
+	if id & ^fallbackCallMask != 0 {
+		panic(fmt.Sprintf("bad call id in fallback signal %v", id))
+	}
+	return uint32(typ) | uint32(id&fallbackCallMask)<<3 | uint32(aux)<<16
+}
+
+func decodeFallbackSignal(s uint32) (typ, id, aux int) {
+	return int(s & 7), int((s >> 3) & fallbackCallMask), int(s >> 16)
 }

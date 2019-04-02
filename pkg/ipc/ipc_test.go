@@ -1,7 +1,7 @@
 // Copyright 2015 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-package ipc
+package ipc_test
 
 import (
 	"fmt"
@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/csource"
+	. "github.com/google/syzkaller/pkg/ipc"
+	"github.com/google/syzkaller/pkg/ipc/ipcconfig"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 )
@@ -20,14 +23,10 @@ import (
 const timeout = 10 * time.Second
 
 func buildExecutor(t *testing.T, target *prog.Target) string {
-	src := fmt.Sprintf("../../executor/executor_%v.cc", target.OS)
-	return buildProgram(t, target, filepath.FromSlash(src))
-}
-
-func buildProgram(t *testing.T, target *prog.Target, src string) string {
-	bin, err := csource.Build(target, "c++", src)
+	src := filepath.FromSlash("../../executor/executor.cc")
+	bin, err := csource.BuildFile(target, src)
 	if err != nil {
-		t.Fatalf("%v", err)
+		t.Fatal(err)
 	}
 	return bin
 }
@@ -38,14 +37,17 @@ func initTest(t *testing.T) (*prog.Target, rand.Source, int, EnvFlags) {
 	if testing.Short() {
 		iters = 10
 	}
-	seed := int64(time.Now().UnixNano())
+	seed := time.Now().UnixNano()
+	if os.Getenv("TRAVIS") != "" {
+		seed = 0 // required for deterministic coverage reports
+	}
 	rs := rand.NewSource(seed)
 	t.Logf("seed=%v", seed)
 	target, err := prog.GetTarget(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, _, err := DefaultConfig()
+	cfg, _, err := ipcconfig.Default(target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,47 +55,24 @@ func initTest(t *testing.T) (*prog.Target, rand.Source, int, EnvFlags) {
 	return target, rs, iters, flags
 }
 
-func TestSimpleProg(t *testing.T) {
-	target, _, _, flags0 := initTest(t)
-
+// TestExecutor runs all internal executor unit tests.
+// We do it here because we already build executor binary here.
+func TestExecutor(t *testing.T) {
+	target, err := prog.GetTarget(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
 	bin := buildExecutor(t, target)
 	defer os.Remove(bin)
-
-	cfg := &Config{
-		Executor: bin,
-		Flags:    flags0,
-		Timeout:  timeout,
-	}
-	env, err := MakeEnv(cfg, 0)
+	output, err := osutil.RunCmd(time.Minute, "", bin, "test")
 	if err != nil {
-		t.Fatalf("failed to create env: %v", err)
+		t.Fatal(err)
 	}
-	defer env.Close()
-	p := target.GenerateSimpleProg()
-	opts := &ExecOpts{}
-	output, info, failed, hanged, err := env.Exec(opts, p)
-	if err != nil {
-		t.Fatalf("failed to run executor: %v", err)
-	}
-	if hanged {
-		t.Fatalf("program hanged:\n%s", output)
-	}
-	if failed {
-		t.Fatalf("program failed:\n%s", output)
-	}
-	if len(info) == 0 {
-		t.Fatalf("no calls executed:\n%s", output)
-	}
-	if info[0].Errno != 0 {
-		t.Fatalf("simple call failed: %v\n%s", info[0].Errno, output)
-	}
-	if len(output) != 0 {
-		t.Fatalf("output on empty program")
-	}
+	t.Logf("executor output:\n%s", output)
 }
 
 func TestExecute(t *testing.T) {
-	target, rs, iters, configFlags := initTest(t)
+	target, _, _, configFlags := initTest(t)
 
 	bin := buildExecutor(t, target)
 	defer os.Remove(bin)
@@ -112,19 +91,81 @@ func TestExecute(t *testing.T) {
 		}
 		defer env.Close()
 
-		for i := 0; i < iters/len(flags); i++ {
-			p := target.Generate(rs, 10, nil)
-			if i == 0 {
-				p = target.GenerateSimpleProg()
-			}
+		for i := 0; i < 10; i++ {
+			p := target.GenerateSimpleProg()
 			opts := &ExecOpts{
 				Flags: flag,
 			}
-			output, _, _, _, err := env.Exec(opts, p)
+			output, info, hanged, err := env.Exec(opts, p)
 			if err != nil {
-				t.Logf("program:\n%s\n", p.Serialize())
-				t.Fatalf("failed to run executor: %v\n%s", err, output)
+				t.Fatalf("failed to run executor: %v", err)
 			}
+			if hanged {
+				t.Fatalf("program hanged:\n%s", output)
+			}
+			if len(info.Calls) == 0 {
+				t.Fatalf("no calls executed:\n%s", output)
+			}
+			if info.Calls[0].Errno != 0 {
+				t.Fatalf("simple call failed: %v\n%s", info.Calls[0].Errno, output)
+			}
+			if len(output) != 0 {
+				t.Fatalf("output on empty program")
+			}
+		}
+	}
+}
+
+func TestParallel(t *testing.T) {
+	target, _, _, configFlags := initTest(t)
+	bin := buildExecutor(t, target)
+	defer os.Remove(bin)
+	cfg := &Config{
+		Executor: bin,
+		Flags:    configFlags,
+	}
+	const P = 10
+	errs := make(chan error, P)
+	for p := 0; p < P; p++ {
+		p := p
+		go func() {
+			env, err := MakeEnv(cfg, p)
+			if err != nil {
+				errs <- fmt.Errorf("failed to create env: %v", err)
+				return
+			}
+			defer func() {
+				env.Close()
+				errs <- err
+			}()
+			p := target.GenerateSimpleProg()
+			opts := &ExecOpts{}
+			output, info, hanged, err := env.Exec(opts, p)
+			if err != nil {
+				err = fmt.Errorf("failed to run executor: %v", err)
+				return
+			}
+			if hanged {
+				err = fmt.Errorf("program hanged:\n%s", output)
+				return
+			}
+			if len(info.Calls) == 0 {
+				err = fmt.Errorf("no calls executed:\n%s", output)
+				return
+			}
+			if info.Calls[0].Errno != 0 {
+				err = fmt.Errorf("simple call failed: %v\n%s", info.Calls[0].Errno, output)
+				return
+			}
+			if len(output) != 0 {
+				err = fmt.Errorf("output on empty program")
+				return
+			}
+		}()
+	}
+	for p := 0; p < P; p++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
 		}
 	}
 }

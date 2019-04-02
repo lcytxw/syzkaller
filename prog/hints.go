@@ -22,9 +22,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
 )
-
-type uint64Set map[uint64]bool
 
 // Example: for comparisons {(op1, op2), (op1, op3), (op1, op4), (op2, op1)}
 // this map will store the following:
@@ -32,17 +31,17 @@ type uint64Set map[uint64]bool
 //		op1: {map[op2]: true, map[op3]: true, map[op4]: true},
 //		op2: {map[op1]: true}
 // }.
-type CompMap map[uint64]uint64Set
+type CompMap map[uint64]map[uint64]bool
 
 const (
 	maxDataLength = 100
 )
 
-var specialIntsSet uint64Set
+var specialIntsSet map[uint64]bool
 
 func (m CompMap) AddComp(arg1, arg2 uint64) {
 	if _, ok := m[arg1]; !ok {
-		m[arg1] = make(uint64Set)
+		m[arg1] = make(map[uint64]bool)
 	}
 	m[arg1][arg2] = true
 }
@@ -67,24 +66,21 @@ func (p *Prog) MutateWithHints(callIndex int, comps CompMap, exec func(p *Prog))
 	p = p.Clone()
 	c := p.Calls[callIndex]
 	execValidate := func() {
-		if debug {
-			if err := p.validate(); err != nil {
-				panic(fmt.Sprintf("invalid hints candidate: %v", err))
-			}
-		}
+		p.Target.SanitizeCall(c)
+		p.debugValidate()
 		exec(p)
 	}
 	ForeachArg(c, func(arg Arg, _ *ArgCtx) {
-		generateHints(p, comps, c, arg, execValidate)
+		generateHints(comps, arg, execValidate)
 	})
 }
 
-func generateHints(p *Prog, compMap CompMap, c *Call, arg Arg, exec func()) {
+func generateHints(compMap CompMap, arg Arg, exec func()) {
 	typ := arg.Type()
 	if typ == nil || typ.Dir() == DirOut {
 		return
 	}
-	switch typ.(type) {
+	switch t := typ.(type) {
 	case *ProcType:
 		// Random proc will not pass validation.
 		// We can mutate it, but only if the resulting value is within the legal range.
@@ -92,6 +88,11 @@ func generateHints(p *Prog, compMap CompMap, c *Call, arg Arg, exec func()) {
 	case *CsumType:
 		// Csum will not pass validation and is always computed.
 		return
+	case *BufferType:
+		if t.Kind == BufferFilename {
+			// This can generate escaping paths and is probably not too useful anyway.
+			return
+		}
 	}
 
 	switch a := arg.(type) {
@@ -104,7 +105,9 @@ func generateHints(p *Prog, compMap CompMap, c *Call, arg Arg, exec func()) {
 
 func checkConstArg(arg *ConstArg, compMap CompMap, exec func()) {
 	original := arg.Val
-	for replacer := range shrinkExpand(original, compMap) {
+	// Note: because shrinkExpand returns a map, order of programs is non-deterministic.
+	// This can affect test coverage reports.
+	for _, replacer := range shrinkExpand(original, compMap) {
 		arg.Val = replacer
 		exec()
 	}
@@ -112,11 +115,6 @@ func checkConstArg(arg *ConstArg, compMap CompMap, exec func()) {
 }
 
 func checkDataArg(arg *DataArg, compMap CompMap, exec func()) {
-	// TODO(dvyukov): we need big-endian match for ANYBLOBs.
-	// TODO(dvyukov): any probably not just for ANYBLOBs. Consider that
-	// kernel code does not convert the data (i.e. not ntohs(pkt->proto) == ETH_P_BATMAN),
-	// but instead converts the constant (i.e. pkt->proto == htons(ETH_P_BATMAN)).
-	// In such case we will see dynamic operand that does not match what we have in the program.
 	bytes := make([]byte, 8)
 	data := arg.Data()
 	size := len(data)
@@ -127,7 +125,7 @@ func checkDataArg(arg *DataArg, compMap CompMap, exec func()) {
 		original := make([]byte, 8)
 		copy(original, data[i:])
 		val := binary.LittleEndian.Uint64(original)
-		for replacer := range shrinkExpand(val, compMap) {
+		for _, replacer := range shrinkExpand(val, compMap) {
 			binary.LittleEndian.PutUint64(bytes, replacer)
 			copy(data[i:], bytes)
 			exec()
@@ -166,44 +164,78 @@ func checkDataArg(arg *DataArg, compMap CompMap, exec func()) {
 // As with shrink we ignore cases when the other operand is wider.
 // Note that executor sign extends all the comparison operands to int64.
 // ======================================================================
-func shrinkExpand(v uint64, compMap CompMap) (replacers uint64Set) {
-	var prev uint64
-	for _, isize := range []int{64, 32, 16, 8, -32, -16, -8} {
-		var mutant uint64
-		var size uint
-		if isize > 0 {
-			size = uint(isize)
+func shrinkExpand(v uint64, compMap CompMap) []uint64 {
+	var replacers map[uint64]bool
+	for _, iwidth := range []int{8, 4, 2, 1, -4, -2, -1} {
+		var width int
+		var size, mutant uint64
+		if iwidth > 0 {
+			width = iwidth
+			size = uint64(width) * 8
 			mutant = v & ((1 << size) - 1)
 		} else {
-			size = uint(-isize)
+			width = -iwidth
+			size = uint64(width) * 8
 			mutant = v | ^((1 << size) - 1)
 		}
-		if size != 64 && prev == mutant {
-			continue
-		}
-		prev = mutant
-		for newV := range compMap[mutant] {
-			mask := uint64(1<<size - 1)
-			if newHi := newV & ^mask; newHi == 0 || newHi^^mask == 0 {
-				if !specialIntsSet[newV&mask] {
-					// Replace size least significant bits of v with
-					// corresponding bits of newV. Leave the rest of v as it was.
-					replacer := (v &^ mask) | (newV & mask)
-					// TODO(dvyukov): should we try replacing with arg+/-1?
-					// This could trigger some off-by-ones.
-					if replacers == nil {
-						replacers = make(uint64Set)
-					}
-					replacers[replacer] = true
+		// Use big-endian match/replace for both blobs and ints.
+		// Sometimes we have unmarked blobs (no little/big-endian info);
+		// for ANYBLOBs we intentionally lose all marking;
+		// but even for marked ints we may need this too.
+		// Consider that kernel code does not convert the data
+		// (i.e. not ntohs(pkt->proto) == ETH_P_BATMAN),
+		// but instead converts the constant (i.e. pkt->proto == htons(ETH_P_BATMAN)).
+		// In such case we will see dynamic operand that does not match what we have in the program.
+		for _, bigendian := range []bool{false, true} {
+			if bigendian {
+				if width == 1 {
+					continue
 				}
+				mutant = swapInt(mutant, width)
+			}
+			for newV := range compMap[mutant] {
+				mask := uint64(1<<size - 1)
+				newHi := newV & ^mask
+				newV = newV & mask
+				if newHi != 0 && newHi^^mask != 0 {
+					continue
+				}
+				if bigendian {
+					newV = swapInt(newV, width)
+				}
+				if specialIntsSet[newV] {
+					continue
+				}
+				// Replace size least significant bits of v with
+				// corresponding bits of newV. Leave the rest of v as it was.
+				replacer := (v &^ mask) | newV
+				if replacer == v {
+					continue
+				}
+				// TODO(dvyukov): should we try replacing with arg+/-1?
+				// This could trigger some off-by-ones.
+				if replacers == nil {
+					replacers = make(map[uint64]bool)
+				}
+				replacers[replacer] = true
 			}
 		}
 	}
-	return
+	if replacers == nil {
+		return nil
+	}
+	res := make([]uint64, 0, len(replacers))
+	for v := range replacers {
+		res = append(res, v)
+	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i] < res[j]
+	})
+	return res
 }
 
 func init() {
-	specialIntsSet = make(uint64Set)
+	specialIntsSet = make(map[uint64]bool)
 	for _, v := range specialInts {
 		specialIntsSet[v] = true
 	}

@@ -6,6 +6,12 @@ foo$1(a int8[C1:C2])
 foo$2(a ptr[out, array[int32]])
 foo$3(a union_arg)
 foo$4() r0
+foo$5(a int8['a':'z'])
+foo$6(a int8[-20:-10])
+foo$7(a int8[-20:20])
+foo$8(a ptr[in, strings])
+foo$9(a ptr[out, ptr[in, string]])
+foo$10(a ptr[out, buffer[in]])
 
 resource r0[intptr]
 
@@ -36,13 +42,17 @@ strings {
 
 string_flags1 = "foo", "barbaz"
 string_flags2 = ""
-int_flags = 0, 1
+int_flags = 0, 1, 0xabc, 'x', -11
+_ = 1, 2
+_ = C1, C2
 
 # Proc type.
 
 proc_struct1 {
 	f1	proc[C0, 8, int8]
 }
+
+foo$proc1(a ptr[in, proc_struct1])
 
 # Len/bytesize types.
 
@@ -59,6 +69,13 @@ type len_temp2[DATA] {
 foo$len_templ(a ptr[in, len_templ1[int8, int16]])
 foo$len_var0(a ptr[in, array[string]], b len[a])
 foo$len_var1(a ptr[in, array[string]], b ptr[in, len[a, int32]])
+
+# Pointer type.
+
+foo$ptr(a ptr[in, int64])
+foo$ptr64(a ptr64[in, int64])
+foo$vma(a vma)
+foo$vma64(a vma64)
 
 # Void type.
 
@@ -101,6 +118,7 @@ struct_with_void1 {
 	f1	int8
 	f2	array[void5]
 	f3	int64
+	f4	optional[int8]
 }
 
 foo$void0(a ptr[in, void0])
@@ -119,6 +137,8 @@ bitfield0 {
 	f1	int8:1
 	f2	int8:2
 }
+
+foo$bitfield0(a ptr[in, bitfield0])
 
 # Type templates.
 
@@ -139,8 +159,8 @@ type templ_struct1[C] {
 }
 
 union_with_templ_struct [
-	f1		templ_struct0[C1, type0]
-	f2		templ_struct0[C2, struct0]
+	f1	templ_struct0[C1, type0]
+	f2	templ_struct0[C2, struct0]
 ] [varlen]
 
 struct0 {
@@ -182,7 +202,8 @@ foo$templ3(a ptr[in, templ_struct1[1]], b ptr[in, templ_struct1[2]])
 foo$templ4(a ptr[in, templ_struct1[3]])
 foo$templ5(a ptr[in, templ_struct1[3]])
 foo$templ6(a ptr[in, templ_struct4])
-
+foo$templ7(a ptr[in, templ_struct5], b ptr[in, templ_struct6], c ptr[in, templ_union], d ptr[in, type3])
+foo$templ8(a ptr[in, templ_templ_use])
 
 # Structs.
 
@@ -194,8 +215,25 @@ s1 {
 	f1	int8
 } [size[C2]]
 
+foo$s0(a ptr[in, s0], b ptr[in, s1])
+
 # Unions.
 
 u0 [
 	f1	int32
 ]
+
+foo$u0(a ptr[in, u0])
+
+# fmt
+
+foo$fmt0(a ptr[in, fmt[dec, int32[1:10]]])
+foo$fmt1(a ptr[in, fmt[hex, flags[int_flags]]])
+foo$fmt2(a ptr[in, fmt[oct, len[b]]], b ptr[in, array[int8]])
+foo$fmt3(a ptr[in, fmt[dec, proc[10, 20]]])
+foo$fmt4(a ptr[in, fmt[dec, r0]])
+foo$fmt5(a ptr[in, struct$fmt0])
+
+struct$fmt0 {
+	f0	fmt[dec, int8]
+}

@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
-	"github.com/google/syzkaller/syz-manager/mgrconfig"
 )
 
 var (
@@ -36,21 +36,20 @@ func main() {
 	}
 	var syscalls map[*prog.Syscall]bool
 	if *flagEnable != "" {
-		syscallsIDs, err := mgrconfig.ParseEnabledSyscalls(target, strings.Split(*flagEnable, ","), nil)
+		enabled := strings.Split(*flagEnable, ",")
+		syscallsIDs, err := mgrconfig.ParseEnabledSyscalls(target, enabled, nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to parse enabled syscalls: %v", err)
 			os.Exit(1)
 		}
 		syscalls = make(map[*prog.Syscall]bool)
-		for id := range syscallsIDs {
+		for _, id := range syscallsIDs {
 			syscalls[target.Syscalls[id]] = true
 		}
-		trans := target.TransitivelyEnabledCalls(syscalls)
-		for c := range syscalls {
-			if !trans[c] {
-				fmt.Fprintf(os.Stderr, "disabling %v\n", c.Name)
-				delete(syscalls, c)
-			}
+		var disabled map[*prog.Syscall]string
+		syscalls, disabled = target.TransitivelyEnabledCalls(syscalls)
+		for c, reason := range disabled {
+			fmt.Fprintf(os.Stderr, "disabling %v: %v\n", c.Name, reason)
 		}
 	}
 	seed := time.Now().UnixNano()
@@ -69,7 +68,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to read prog file: %v\n", err)
 			os.Exit(1)
 		}
-		p, err = target.Deserialize(data)
+		p, err = target.Deserialize(data, prog.NonStrict)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to deserialize the program: %v\n", err)
 			os.Exit(1)

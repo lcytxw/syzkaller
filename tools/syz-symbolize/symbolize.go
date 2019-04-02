@@ -10,11 +10,13 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
 )
 
 var (
 	flagOS        = flag.String("os", runtime.GOOS, "target os")
+	flagArch      = flag.String("arch", runtime.GOARCH, "target arch")
 	flagKernelSrc = flag.String("kernel_src", ".", "path to kernel sources")
 	flagKernelObj = flag.String("kernel_obj", ".", "path to kernel build/obj dir")
 )
@@ -26,7 +28,13 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	reporter, err := report.NewReporter(*flagOS, *flagKernelSrc, *flagKernelObj, nil, nil)
+	cfg := &mgrconfig.Config{
+		TargetOS:   *flagOS,
+		TargetArch: *flagArch,
+		KernelObj:  *flagKernelObj,
+		KernelSrc:  *flagKernelSrc,
+	}
+	reporter, err := report.NewReporter(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create reporter: %v\n", err)
 		os.Exit(1)
@@ -44,5 +52,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to symbolize report: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("TITLE: %v\n", rep.Title)
+	fmt.Printf("CORRUPTED: %v (%v)\n", rep.Corrupted, rep.CorruptedReason)
+	fmt.Printf("MAINTAINERS: %v\n", rep.Maintainers)
+	fmt.Printf("\n")
 	os.Stdout.Write(rep.Report)
 }

@@ -18,7 +18,8 @@ import (
 	"io/ioutil"
 	"os"
 
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/hash"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
@@ -47,7 +48,9 @@ func Open(filename string) (*DB, error) {
 	db.Version, db.Records, db.uncompacted = deserializeDB(bufio.NewReader(f))
 	f.Close()
 	if len(db.Records) == 0 || db.uncompacted/10*9 > len(db.Records) {
-		db.compact()
+		if err := db.compact(); err != nil {
+			return nil, err
+		}
 	}
 	return db, nil
 }
@@ -75,8 +78,7 @@ func (db *DB) Delete(key string) {
 
 func (db *DB) Flush() error {
 	if db.uncompacted/10*9 > len(db.Records) {
-		db.compact()
-		return nil
+		return db.compact()
 	}
 	if db.pending == nil {
 		return nil
@@ -116,7 +118,7 @@ func (db *DB) compact() error {
 		return err
 	}
 	f.Close()
-	if err := os.Rename(f.Name(), db.filename); err != nil {
+	if err := osutil.Rename(f.Name(), db.filename); err != nil {
 		return err
 	}
 	db.uncompacted = len(db.Records)
@@ -168,7 +170,6 @@ func serializeRecord(w *bytes.Buffer, key string, val []byte, seq uint64) {
 		if _, err := fw.Write(val); err != nil {
 			panic(err)
 		}
-		fw.Flush()
 		fw.Close()
 		binary.Write(bytes.NewBuffer(w.Bytes()[lenPos:lenPos:lenPos+8]), binary.LittleEndian, uint32(len(w.Bytes())-startPos))
 	}
@@ -178,7 +179,7 @@ func deserializeDB(r *bufio.Reader) (version uint64, records map[string]Record, 
 	records = make(map[string]Record)
 	ver, err := deserializeHeader(r)
 	if err != nil {
-		Logf(0, "failed to deserialize database header: %v", err)
+		log.Logf(0, "failed to deserialize database header: %v", err)
 		return
 	}
 	version = ver
@@ -188,7 +189,7 @@ func deserializeDB(r *bufio.Reader) (version uint64, records map[string]Record, 
 			return
 		}
 		if err != nil {
-			Logf(0, "failed to deserialize database record: %v", err)
+			log.Logf(0, "failed to deserialize database record: %v", err)
 			return
 		}
 		uncompacted++
@@ -255,11 +256,30 @@ func deserializeRecord(r *bufio.Reader) (key string, val []byte, seq uint64, err
 		return
 	}
 	if valLen != 0 {
-		fr := flate.NewReader(&io.LimitedReader{r, int64(valLen)})
+		fr := flate.NewReader(&io.LimitedReader{R: r, N: int64(valLen)})
 		if val, err = ioutil.ReadAll(fr); err != nil {
 			return
 		}
 		fr.Close()
 	}
 	return
+}
+
+// Create creates a new database in the specified file with the specified records.
+func Create(filename string, version uint64, records []Record) error {
+	os.Remove(filename)
+	db, err := Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open database file: %v", err)
+	}
+	if err := db.BumpVersion(version); err != nil {
+		return fmt.Errorf("failed to bump database version: %v", err)
+	}
+	for _, rec := range records {
+		db.Save(hash.String(rec.Val), rec.Val, rec.Seq)
+	}
+	if err := db.Flush(); err != nil {
+		return fmt.Errorf("failed to save database file: %v", err)
+	}
+	return nil
 }

@@ -18,25 +18,25 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 func init() {
-	vmimpl.Register("adb", ctor)
+	vmimpl.Register("adb", ctor, false)
 }
 
 type Config struct {
-	Adb     string   // adb binary name ("adb" by default)
-	Devices []string // list of adb device IDs to use
+	Adb     string   `json:"adb"`     // adb binary name ("adb" by default)
+	Devices []string `json:"devices"` // list of adb device IDs to use
 
 	// Ensure that a device battery level is at 20+% before fuzzing.
 	// Sometimes we observe that a device can't charge during heavy fuzzing
 	// and eventually powers down (which then requires manual intervention).
 	// This option is enabled by default. Turn it off if your devices
 	// don't have battery service, or it causes problems otherwise.
-	Battery_Check bool
+	BatteryCheck bool `json:"battery_check"`
 }
 
 type Pool struct {
@@ -54,8 +54,8 @@ type instance struct {
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{
-		Adb:           "adb",
-		Battery_Check: true,
+		Adb:          "adb",
+		BatteryCheck: true,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse adb vm config: %v", err)
@@ -103,7 +103,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		return nil, err
 	}
 	inst.console = findConsole(inst.adbBin, inst.device)
-	if pool.cfg.Battery_Check {
+	if pool.cfg.BatteryCheck {
 		if err := inst.checkBatteryLevel(); err != nil {
 			return nil, err
 		}
@@ -112,6 +112,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 	if _, err := inst.adb("shell", "rm -Rf /data/syzkaller*"); err != nil {
 		return nil, err
 	}
+	inst.adb("shell", "echo 0 > /proc/sys/kernel/kptr_restrict")
 	closeInst = nil
 	return inst, nil
 }
@@ -138,20 +139,28 @@ func findConsole(adb, dev string) string {
 	}
 	con, err := findConsoleImpl(adb, dev)
 	if err != nil {
-		Logf(0, "failed to associate adb device %v with console: %v", dev, err)
-		Logf(0, "falling back to 'adb shell dmesg -w'")
-		Logf(0, "note: some bugs may be detected as 'lost connection to test machine' with no kernel output")
+		log.Logf(0, "failed to associate adb device %v with console: %v", dev, err)
+		log.Logf(0, "falling back to 'adb shell dmesg -w'")
+		log.Logf(0, "note: some bugs may be detected as 'lost connection to test machine' with no kernel output")
 		con = "adb"
 		devToConsole[dev] = con
 		return con
 	}
 	devToConsole[dev] = con
 	consoleToDev[con] = dev
-	Logf(0, "associating adb device %v with console %v", dev, con)
+	log.Logf(0, "associating adb device %v with console %v", dev, con)
 	return con
 }
 
 func findConsoleImpl(adb, dev string) (string, error) {
+	// Attempt to find an exact match, at /dev/ttyUSB.{SERIAL}
+	// This is something that can be set up on Linux via 'udev' rules
+	exactCon := "/dev/ttyUSB." + dev
+	if osutil.IsExist(exactCon) {
+		return exactCon, nil
+	}
+
+	// Search all consoles, as described in 'findConsole'
 	consoles, err := filepath.Glob("/dev/ttyUSB*")
 	if err != nil {
 		return "", fmt.Errorf("failed to list /dev/ttyUSB devices: %v", err)
@@ -185,7 +194,7 @@ func findConsoleImpl(adb, dev string) (string, error) {
 	}
 	time.Sleep(500 * time.Millisecond)
 	unique := fmt.Sprintf(">>>%v<<<", dev)
-	cmd := osutil.Command(adb, "-s", dev, "shell", "echo", "\"", unique, "\"", ">", "/dev/kmsg")
+	cmd := osutil.Command(adb, "-s", dev, "shell", "echo", "\"<1>", unique, "\"", ">", "/dev/kmsg")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("failed to run adb shell: %v\n%s", err, out)
 	}
@@ -221,56 +230,27 @@ func findConsoleImpl(adb, dev string) (string, error) {
 }
 
 func (inst *instance) Forward(port int) (string, error) {
-	// If 35099 turns out to be busy, try to forward random ports several times.
-	devicePort := 35099
-	if _, err := inst.adb("reverse", fmt.Sprintf("tcp:%v", devicePort), fmt.Sprintf("tcp:%v", port)); err != nil {
-		return "", err
+	var err error
+	for i := 0; i < 1000; i++ {
+		devicePort := vmimpl.RandomPort()
+		_, err = inst.adb("reverse", fmt.Sprintf("tcp:%v", devicePort), fmt.Sprintf("tcp:%v", port))
+		if err == nil {
+			return fmt.Sprintf("127.0.0.1:%v", devicePort), nil
+		}
 	}
-	return fmt.Sprintf("127.0.0.1:%v", devicePort), nil
+	return "", err
 }
 
 func (inst *instance) adb(args ...string) ([]byte, error) {
 	if inst.debug {
-		Logf(0, "executing adb %+v", args)
+		log.Logf(0, "executing adb %+v", args)
 	}
-	rpipe, wpipe, err := os.Pipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pipe: %v", err)
-	}
-	defer wpipe.Close()
-	defer rpipe.Close()
-	cmd := osutil.Command(inst.adbBin, append([]string{"-s", inst.device}, args...)...)
-	cmd.Stdout = wpipe
-	cmd.Stderr = wpipe
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	wpipe.Close()
-	done := make(chan bool)
-	go func() {
-		select {
-		case <-time.After(time.Minute):
-			if inst.debug {
-				Logf(0, "adb hanged")
-			}
-			cmd.Process.Kill()
-		case <-done:
-		}
-	}()
-	if err := cmd.Wait(); err != nil {
-		close(done)
-		out, _ := ioutil.ReadAll(rpipe)
-		if inst.debug {
-			Logf(0, "adb failed: %v\n%s", err, out)
-		}
-		return nil, fmt.Errorf("adb %+v failed: %v\n%s", args, err, out)
-	}
-	close(done)
+	args = append([]string{"-s", inst.device}, args...)
+	out, err := osutil.RunCmd(time.Minute, "", inst.adbBin, args...)
 	if inst.debug {
-		Logf(0, "adb returned")
+		log.Logf(0, "adb returned")
 	}
-	out, _ := ioutil.ReadAll(rpipe)
-	return out, nil
+	return out, err
 }
 
 func (inst *instance) repair() error {
@@ -320,11 +300,11 @@ func (inst *instance) checkBatteryLevel() error {
 		return err
 	}
 	if val >= minLevel {
-		Logf(0, "device %v: battery level %v%%, OK", inst.device, val)
+		log.Logf(0, "device %v: battery level %v%%, OK", inst.device, val)
 		return nil
 	}
 	for {
-		Logf(0, "device %v: battery level %v%%, waiting for %v%%", inst.device, val, requiredLevel)
+		log.Logf(0, "device %v: battery level %v%%, waiting for %v%%", inst.device, val, requiredLevel)
 		if !vmimpl.SleepInterruptible(time.Minute) {
 			return nil
 		}
@@ -348,11 +328,10 @@ func (inst *instance) getBatteryLevel(numRetry int) (int, error) {
 			// sleep for 5 seconds before retrying
 			time.Sleep(5 * time.Second)
 			out, err = inst.adb("shell", "dumpsys battery | grep level:")
-		} else {
-			if err != nil {
-				return 0, err
-			}
 		}
+	}
+	if err != nil {
+		return 0, err
 	}
 	val := 0
 	for _, c := range out {
@@ -382,7 +361,8 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	<-chan []byte, <-chan error, error) {
 	var tty io.ReadCloser
 	var err error
 	if inst.console == "adb" {
@@ -400,7 +380,7 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		return nil, nil, err
 	}
 	if inst.debug {
-		Logf(0, "starting: adb shell %v", command)
+		log.Logf(0, "starting: adb shell %v", command)
 	}
 	adb := osutil.Command(inst.adbBin, "-s", inst.device, "shell", "cd /data; "+command)
 	adb.Stdout = adbWpipe
@@ -421,41 +401,9 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	merger.Add("console", tty)
 	merger.Add("adb", adbRpipe)
 
-	errc := make(chan error, 1)
-	signal := func(err error) {
-		select {
-		case errc <- err:
-		default:
-		}
-	}
+	return vmimpl.Multiplex(adb, merger, tty, timeout, stop, inst.closed, inst.debug)
+}
 
-	go func() {
-		select {
-		case <-time.After(timeout):
-			signal(vmimpl.ErrTimeout)
-		case <-stop:
-			signal(vmimpl.ErrTimeout)
-		case <-inst.closed:
-			if inst.debug {
-				Logf(0, "instance closed")
-			}
-			signal(fmt.Errorf("instance closed"))
-		case err := <-merger.Err:
-			adb.Process.Kill()
-			tty.Close()
-			merger.Wait()
-			if cmdErr := adb.Wait(); cmdErr == nil {
-				// If the command exited successfully, we got EOF error from merger.
-				// But in this case no error has happened and the EOF is expected.
-				err = nil
-			}
-			signal(err)
-			return
-		}
-		adb.Process.Kill()
-		tty.Close()
-		merger.Wait()
-		adb.Wait()
-	}()
-	return merger.Output, errc, nil
+func (inst *instance) Diagnose() ([]byte, bool) {
+	return nil, false
 }

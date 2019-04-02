@@ -4,61 +4,46 @@
 // This file is shared between executor and csource package.
 
 #include <fcntl.h>
+#include <lib/fdio/directory.h>
 #include <poll.h>
+#include <signal.h>
+#include <stdlib.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 #include <utime.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
-#if defined(SYZ_EXECUTOR) || defined(SYZ_THREADED) || defined(SYZ_COLLIDE)
+
+#if SYZ_EXECUTOR || __NR_get_root_resource
+#include <ddk/driver.h>
+#endif
+
+#if SYZ_EXECUTOR || SYZ_HANDLE_SEGV
 #include <pthread.h>
-#include <stdlib.h>
-#endif
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-#include <errno.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#include <time.h>
-#endif
-#if defined(SYZ_EXECUTOR) || defined(SYZ_HANDLE_SEGV)
+#include <setjmp.h>
 #include <zircon/syscalls/debug.h>
 #include <zircon/syscalls/exception.h>
 #include <zircon/syscalls/object.h>
 #include <zircon/syscalls/port.h>
-#endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||      \
-    defined(SYZ_USE_TMP_DIR) || defined(SYZ_HANDLE_SEGV) || defined(SYZ_TUN_ENABLE) || \
-    defined(SYZ_SANDBOX_NAMESPACE) || defined(SYZ_SANDBOX_SETUID) ||                   \
-    defined(SYZ_SANDBOX_NONE) || defined(SYZ_FAULT_INJECTION) || defined(__NR_syz_kvm_setup_cpu)
-__attribute__((noreturn)) static void doexit(int status)
-{
-	_exit(status);
-	for (;;) {
-	}
-}
-#endif
-
-#include "common.h"
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_HANDLE_SEGV)
 static __thread int skip_segv;
 static __thread jmp_buf segv_env;
 
-static void segv_handler()
+static void segv_handler(void)
 {
 	if (__atomic_load_n(&skip_segv, __ATOMIC_RELAXED)) {
 		debug("recover: skipping\n");
-		_longjmp(segv_env, 1);
+		longjmp(segv_env, 1);
 	}
 	debug("recover: exiting\n");
-	doexit(1);
+	doexit(SIGSEGV);
 }
 
 static void* ex_handler(void* arg)
@@ -66,13 +51,13 @@ static void* ex_handler(void* arg)
 	zx_handle_t port = (zx_handle_t)(long)arg;
 	for (int i = 0; i < 10000; i++) {
 		zx_port_packet_t packet = {};
-		zx_status_t status = zx_port_wait(port, ZX_TIME_INFINITE, &packet, 0);
+		zx_status_t status = zx_port_wait(port, ZX_TIME_INFINITE, &packet);
 		if (status != ZX_OK) {
 			debug("zx_port_wait failed: %d\n", status);
 			continue;
 		}
 		debug("got exception packet: type=%d status=%d tid=%llu\n",
-		      packet.type, packet.status, packet.exception.tid);
+		      packet.type, packet.status, (unsigned long long)(packet.exception.tid));
 		zx_handle_t thread;
 		status = zx_object_get_child(zx_process_self(), packet.exception.tid,
 					     ZX_RIGHT_SAME_RIGHTS, &thread);
@@ -80,29 +65,36 @@ static void* ex_handler(void* arg)
 			debug("zx_object_get_child failed: %d\n", status);
 			continue;
 		}
-		uint32 bytes_read;
-		zx_x86_64_general_regs_t regs;
-		status = zx_thread_read_state(thread, ZX_THREAD_STATE_REGSET0,
-					      &regs, sizeof(regs), &bytes_read);
-		if (status != ZX_OK || bytes_read != sizeof(regs)) {
-			debug("zx_thread_read_state failed: %d/%d (%d)\n",
-			      bytes_read, (int)sizeof(regs), status);
+		zx_thread_state_general_regs_t regs;
+		status = zx_thread_read_state(thread, ZX_THREAD_STATE_GENERAL_REGS,
+					      &regs, sizeof(regs));
+		if (status != ZX_OK) {
+			debug("zx_thread_read_state failed: %d (%d)\n",
+			      (int)sizeof(regs), status);
 		} else {
+#if GOARCH_amd64
 			regs.rip = (uint64)(void*)&segv_handler;
-			status = zx_thread_write_state(thread, ZX_THREAD_STATE_REGSET0, &regs, sizeof(regs));
-			if (status != ZX_OK)
+#elif GOARCH_arm64
+			regs.pc = (uint64)(void*)&segv_handler;
+#else
+#error "unsupported arch"
+#endif
+			status = zx_thread_write_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs));
+			if (status != ZX_OK) {
 				debug("zx_thread_write_state failed: %d\n", status);
+			}
 		}
-		status = zx_task_resume(thread, ZX_RESUME_EXCEPTION);
-		if (status != ZX_OK)
-			debug("zx_task_resume failed: %d\n", status);
+		status = zx_task_resume_from_exception(thread, port, 0);
+		if (status != ZX_OK) {
+			debug("zx_task_resume_from_exception failed: %d\n", status);
+		}
 		zx_handle_close(thread);
 	}
 	doexit(1);
 	return 0;
 }
 
-static void install_segv_handler()
+static void install_segv_handler(void)
 {
 	zx_status_t status;
 	zx_handle_t port;
@@ -118,94 +110,117 @@ static void install_segv_handler()
 #define NONFAILING(...)                                              \
 	{                                                            \
 		__atomic_fetch_add(&skip_segv, 1, __ATOMIC_SEQ_CST); \
-		if (_setjmp(segv_env) == 0) {                        \
+		if (sigsetjmp(segv_env, 0) == 0) {                   \
 			__VA_ARGS__;                                 \
 		}                                                    \
 		__atomic_fetch_sub(&skip_segv, 1, __ATOMIC_SEQ_CST); \
 	}
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-static uint64 current_time_ms()
-{
-	struct timespec ts;
+#if SYZ_EXECUTOR || SYZ_THREADED
+#include <unistd.h>
 
-	if (clock_gettime(CLOCK_MONOTONIC, &ts))
-		fail("clock_gettime failed");
-	return (uint64)ts.tv_sec * 1000 + (uint64)ts.tv_nsec / 1000000;
+// Fuchsia's pthread_cond_timedwait just returns immidiately, so we use simple spin wait.
+typedef struct {
+	int state;
+} event_t;
+
+static void event_init(event_t* ev)
+{
+	ev->state = 0;
+}
+
+static void event_reset(event_t* ev)
+{
+	ev->state = 0;
+}
+
+static void event_set(event_t* ev)
+{
+	if (ev->state)
+		fail("event already set");
+	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
+}
+
+static void event_wait(event_t* ev)
+{
+	while (!__atomic_load_n(&ev->state, __ATOMIC_ACQUIRE))
+		usleep(200);
+}
+
+static int event_isset(event_t* ev)
+{
+	return __atomic_load_n(&ev->state, __ATOMIC_ACQUIRE);
+}
+
+static int event_timedwait(event_t* ev, uint64 timeout_ms)
+{
+	uint64 start = current_time_ms();
+	for (;;) {
+		if (__atomic_load_n(&ev->state, __ATOMIC_RELAXED))
+			return 1;
+		if (current_time_ms() - start > timeout_ms)
+			return 0;
+		usleep(200);
+	}
 }
 #endif
 
-#if defined(SYZ_EXECUTOR)
-static void sleep_ms(uint64 ms)
-{
-	usleep(ms * 1000);
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(SYZ_FAULT_INJECTION)
-static int inject_fault(int nth)
-{
-	return 0;
-}
-
-static int fault_injected(int fail_fd)
-{
-	return 0;
-}
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_mmap)
+#if SYZ_EXECUTOR || __NR_syz_mmap
 long syz_mmap(size_t addr, size_t size)
 {
 	zx_handle_t root = zx_vmar_root_self();
 	zx_info_vmar_t info;
 	zx_status_t status = zx_object_get_info(root, ZX_INFO_VMAR, &info, sizeof(info), 0, 0);
 	if (status != ZX_OK)
-		error("zx_object_get_info(ZX_INFO_VMAR) failed: %d", status);
+		fail("zx_object_get_info(ZX_INFO_VMAR) failed: %d", status);
 	zx_handle_t vmo;
 	status = zx_vmo_create(size, 0, &vmo);
+	if (status != ZX_OK) {
+		debug("zx_vmo_create failed with: %d\n", status);
+		return status;
+	}
+	status = zx_vmo_replace_as_executable(vmo, ZX_HANDLE_INVALID, &vmo);
 	if (status != ZX_OK)
 		return status;
 	uintptr_t mapped_addr;
-	status = zx_vmar_map(root, addr - info.base, vmo, 0, size,
-			     ZX_VM_FLAG_SPECIFIC_OVERWRITE | ZX_VM_FLAG_PERM_READ |
-				 ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE,
+	status = zx_vmar_map(root, ZX_VM_FLAG_SPECIFIC_OVERWRITE | ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE,
+			     addr - info.base, vmo, 0, size,
 			     &mapped_addr);
 	return status;
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_process_self)
-long syz_process_self()
+#if SYZ_EXECUTOR || __NR_syz_process_self
+static long syz_process_self(void)
 {
 	return zx_process_self();
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_thread_self)
-long syz_thread_self()
+#if SYZ_EXECUTOR || __NR_syz_thread_self
+static long syz_thread_self(void)
 {
 	return zx_thread_self();
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_vmar_root_self)
-long syz_vmar_root_self()
+#if SYZ_EXECUTOR || __NR_syz_vmar_root_self
+static long syz_vmar_root_self(void)
 {
 	return zx_vmar_root_self();
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_job_default)
-long syz_job_default()
+#if SYZ_EXECUTOR || __NR_syz_job_default
+static long syz_job_default(void)
 {
 	return zx_job_default();
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_syz_future_time)
-long syz_future_time(long when)
+#if SYZ_EXECUTOR || __NR_syz_future_time
+static long syz_future_time(volatile long when)
 {
 	zx_time_t delta_ms;
 	switch (when) {
@@ -216,26 +231,20 @@ long syz_future_time(long when)
 	default:
 		delta_ms = 10000;
 	}
-	zx_time_t now = zx_time_get(ZX_CLOCK_MONOTONIC);
+	zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
 	return now + delta_ms * 1000 * 1000;
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_zx_channel_call_finish) || defined(zx_channel_call_noretry)
-#include "kernel/lib/vdso/vdso-code.h"
-#define UNEXPORTED(name) ((syscall_t)((long)&zx_handle_close - VDSO_SYSCALL_zx_handle_close + VDSO_SYSCALL_##name))
-#endif
-
-#if defined(SYZ_EXECUTOR) || defined(__NR_zx_channel_call_finish)
-zx_status_t zx_channel_call_finish(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8)
+#if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
+static void loop();
+static int do_sandbox_none(void)
 {
-	return UNEXPORTED(zx_channel_call_finish)(a0, a1, a2, a3, a4, a5, a6, a7, a8);
+	loop();
+	return 0;
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || defined(__NR_zx_channel_call_noretry)
-zx_status_t zx_channel_call_noretry(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8)
-{
-	return UNEXPORTED(zx_channel_call_noretry)(a0, a1, a2, a3, a4, a5, a6, a7, a8);
-}
-#endif
+// Ugly way to work around gcc's "error: function called through a non-compatible type".
+// The macro is used in generated C code.
+#define CAST(f) ({void* p = (void*)f; p; })

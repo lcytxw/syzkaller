@@ -30,25 +30,41 @@ func RunCmd(timeout time.Duration, dir, bin string, args ...string) ([]byte, err
 // Returns combined output. If the command fails, err includes output.
 func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 	output := new(bytes.Buffer)
-	cmd.Stdout = output
-	cmd.Stderr = output
+	if cmd.Stdout == nil {
+		cmd.Stdout = output
+	}
+	if cmd.Stderr == nil {
+		cmd.Stderr = output
+	}
+	setPdeathsig(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start %v %+v: %v", cmd.Path, cmd.Args, err)
 	}
 	done := make(chan bool)
+	timedout := make(chan bool, 1)
 	timer := time.NewTimer(timeout)
 	go func() {
 		select {
 		case <-timer.C:
+			timedout <- true
+			killPgroup(cmd)
 			cmd.Process.Kill()
 		case <-done:
+			timedout <- false
 			timer.Stop()
 		}
 	}()
-	defer close(done)
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("failed to run %v %+v: %v\n%v",
-			cmd.Path, cmd.Args, err, output.String())
+	err := cmd.Wait()
+	close(done)
+	if err != nil {
+		text := fmt.Sprintf("failed to run %q: %v", cmd.Args, err)
+		if <-timedout {
+			text = fmt.Sprintf("timedout %q", cmd.Args)
+		}
+		return output.Bytes(), &VerboseError{
+			Title:  text,
+			Output: output.Bytes(),
+		}
 	}
 	return output.Bytes(), nil
 }
@@ -60,16 +76,54 @@ func Command(bin string, args ...string) *exec.Cmd {
 	return cmd
 }
 
+type VerboseError struct {
+	Title  string
+	Output []byte
+}
+
+func (err *VerboseError) Error() string {
+	if len(err.Output) == 0 {
+		return err.Title
+	}
+	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+}
+
+func PrependContext(ctx string, err error) error {
+	switch err1 := err.(type) {
+	case *VerboseError:
+		err1.Title = fmt.Sprintf("%v: %v", ctx, err1.Title)
+		return err1
+	default:
+		return fmt.Errorf("%v: %v", ctx, err)
+	}
+}
+
 // IsExist returns true if the file name exists.
 func IsExist(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
 }
 
+// IsAccessible checks if the file can be opened.
+func IsAccessible(name string) error {
+	if !IsExist(name) {
+		return fmt.Errorf("%v does not exist", name)
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return fmt.Errorf("%v can't be opened (%v)", name, err)
+	}
+	f.Close()
+	return nil
+}
+
 // FilesExist returns true if all files exist in dir.
 // Files are assumed to be relative names in slash notation.
-func FilesExist(dir string, files []string) bool {
-	for _, f := range files {
+func FilesExist(dir string, files map[string]bool) bool {
+	for f, required := range files {
+		if !required {
+			continue
+		}
 		if !IsExist(filepath.Join(dir, filepath.FromSlash(f))) {
 			return false
 		}
@@ -80,7 +134,7 @@ func FilesExist(dir string, files []string) bool {
 // CopyFiles copies files from srcDir to dstDir as atomically as possible.
 // Files are assumed to be relative names in slash notation.
 // All other files in dstDir are removed.
-func CopyFiles(srcDir, dstDir string, files []string) error {
+func CopyFiles(srcDir, dstDir string, files map[string]bool) error {
 	// Linux does not support atomic dir replace, so we copy to tmp dir first.
 	// Then remove dst dir and rename tmp to dst (as atomic as can get on Linux).
 	tmpDir := dstDir + ".tmp"
@@ -90,8 +144,11 @@ func CopyFiles(srcDir, dstDir string, files []string) error {
 	if err := MkdirAll(tmpDir); err != nil {
 		return err
 	}
-	for _, f := range files {
+	for f, required := range files {
 		src := filepath.Join(srcDir, filepath.FromSlash(f))
+		if !required && !IsExist(src) {
+			continue
+		}
 		dst := filepath.Join(tmpDir, filepath.FromSlash(f))
 		if err := MkdirAll(filepath.Dir(dst)); err != nil {
 			return err
@@ -109,15 +166,18 @@ func CopyFiles(srcDir, dstDir string, files []string) error {
 // LinkFiles creates hard links for files from dstDir to srcDir.
 // Files are assumed to be relative names in slash notation.
 // All other files in dstDir are removed.
-func LinkFiles(srcDir, dstDir string, files []string) error {
+func LinkFiles(srcDir, dstDir string, files map[string]bool) error {
 	if err := os.RemoveAll(dstDir); err != nil {
 		return err
 	}
 	if err := MkdirAll(dstDir); err != nil {
 		return err
 	}
-	for _, f := range files {
+	for f, required := range files {
 		src := filepath.Join(srcDir, filepath.FromSlash(f))
+		if !required && !IsExist(src) {
+			continue
+		}
 		dst := filepath.Join(dstDir, filepath.FromSlash(f))
 		if err := MkdirAll(filepath.Dir(dst)); err != nil {
 			return err
@@ -138,7 +198,19 @@ func WriteFile(filename string, data []byte) error {
 }
 
 func WriteExecFile(filename string, data []byte) error {
+	os.Remove(filename)
 	return ioutil.WriteFile(filename, data, DefaultExecPerm)
+}
+
+// TempFile creates a unique temp filename.
+// Note: the file already exists when the function returns.
+func TempFile(prefix string) (string, error) {
+	f, err := ioutil.TempFile("", prefix)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	f.Close()
+	return f.Name(), nil
 }
 
 // Return all files in a directory.

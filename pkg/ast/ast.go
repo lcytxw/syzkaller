@@ -169,11 +169,20 @@ func (n *String) Info() (Pos, string, string) {
 	return n.Pos, tok2str[tokString], ""
 }
 
+type IntFmt int
+
+const (
+	IntFmtDec IntFmt = iota
+	IntFmtNeg
+	IntFmtHex
+	IntFmtChar
+)
+
 type Int struct {
 	Pos Pos
 	// Only one of Value, Ident, CExpr is filled.
 	Value    uint64
-	ValueHex bool // says if value was in hex (for formatting)
+	ValueFmt IntFmt
 	Ident    string
 	CExpr    string
 }
@@ -186,7 +195,7 @@ type Type struct {
 	Pos Pos
 	// Only one of Value, Ident, String is filled.
 	Value     uint64
-	ValueHex  bool
+	ValueFmt  IntFmt
 	Ident     string
 	String    string
 	HasString bool
@@ -194,7 +203,7 @@ type Type struct {
 	HasColon  bool
 	Pos2      Pos
 	Value2    uint64
-	Value2Hex bool
+	Value2Fmt IntFmt
 	Ident2    string
 	Args      []*Type
 }

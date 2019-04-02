@@ -1,13 +1,17 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-package ifuzz
+package ifuzz_test
 
 import (
 	"encoding/hex"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
+
+	. "github.com/google/syzkaller/pkg/ifuzz"
+	_ "github.com/google/syzkaller/pkg/ifuzz/generated"
 )
 
 func TestMode(t *testing.T) {
@@ -32,7 +36,10 @@ func TestMode(t *testing.T) {
 }
 
 func TestDecode(t *testing.T) {
-	seed := int64(time.Now().UnixNano())
+	seed := time.Now().UnixNano()
+	if os.Getenv("TRAVIS") != "" {
+		seed = 0 // required for deterministic coverage reports
+	}
 	t.Logf("seed=%v", seed)
 	r := rand.New(rand.NewSource(seed))
 

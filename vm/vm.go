@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/vm/vmimpl"
@@ -21,10 +22,12 @@ import (
 	// Import all VM implementations, so that users only need to import vm.
 	_ "github.com/google/syzkaller/vm/adb"
 	_ "github.com/google/syzkaller/vm/gce"
+	_ "github.com/google/syzkaller/vm/gvisor"
 	_ "github.com/google/syzkaller/vm/isolated"
 	_ "github.com/google/syzkaller/vm/kvm"
 	_ "github.com/google/syzkaller/vm/odroid"
 	_ "github.com/google/syzkaller/vm/qemu"
+	_ "github.com/google/syzkaller/vm/vmm"
 )
 
 type Pool struct {
@@ -38,19 +41,46 @@ type Instance struct {
 	index   int
 }
 
-type Env vmimpl.Env
-
 var (
-	Shutdown   = vmimpl.Shutdown
-	ErrTimeout = vmimpl.ErrTimeout
+	Shutdown               = vmimpl.Shutdown
+	ErrTimeout             = vmimpl.ErrTimeout
+	_          BootErrorer = vmimpl.BootError{}
 )
 
 type BootErrorer interface {
 	BootError() (string, []byte)
 }
 
-func Create(typ string, env *Env) (*Pool, error) {
-	impl, err := vmimpl.Create(typ, (*vmimpl.Env)(env))
+// AllowsOvercommit returns if the instance type allows overcommit of instances
+// (i.e. creation of instances out-of-thin-air). Overcommit is used during image
+// and patch testing in syz-ci when it just asks for more than specified in config
+// instances. Generally virtual machines (qemu, gce) support overcommit,
+// while physical machines (adb, isolated) do not. Strictly speaking, we should
+// never use overcommit and use only what's specified in config, because we
+// override resource limits specified in config (e.g. can OOM). But it works and
+// makes lots of things much simpler.
+func AllowsOvercommit(typ string) bool {
+	return vmimpl.Types[typ].Overcommit
+}
+
+// Create creates a VM pool that can be used to create individual VMs.
+func Create(cfg *mgrconfig.Config, debug bool) (*Pool, error) {
+	typ, ok := vmimpl.Types[cfg.Type]
+	if !ok {
+		return nil, fmt.Errorf("unknown instance type '%v'", cfg.Type)
+	}
+	env := &vmimpl.Env{
+		Name:    cfg.Name,
+		OS:      cfg.TargetOS,
+		Arch:    cfg.TargetVMArch,
+		Workdir: cfg.Workdir,
+		Image:   cfg.Image,
+		SSHKey:  cfg.SSHKey,
+		SSHUser: cfg.SSHUser,
+		Debug:   debug,
+		Config:  cfg.VM,
+	}
+	impl, err := typ.Ctor(env)
 	if err != nil {
 		return nil, err
 	}
@@ -92,8 +122,13 @@ func (inst *Instance) Forward(port int) (string, error) {
 	return inst.impl.Forward(port)
 }
 
-func (inst *Instance) Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error) {
+func (inst *Instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	outc <-chan []byte, errc <-chan error, err error) {
 	return inst.impl.Run(timeout, stop, command)
+}
+
+func (inst *Instance) Diagnose() ([]byte, bool) {
+	return inst.impl.Diagnose()
 }
 
 func (inst *Instance) Close() {
@@ -101,131 +136,109 @@ func (inst *Instance) Close() {
 	os.RemoveAll(inst.workdir)
 }
 
+type ExitCondition int
+
+const (
+	// The program is allowed to exit after timeout.
+	ExitTimeout = ExitCondition(1 << iota)
+	// The program is allowed to exit with no errors.
+	ExitNormal
+	// The program is allowed to exit with errors.
+	ExitError
+)
+
 // MonitorExecution monitors execution of a program running inside of a VM.
 // It detects kernel oopses in output, lost connections, hangs, etc.
 // outc/errc is what vm.Instance.Run returns, reporter parses kernel output for oopses.
-// If canExit is false and the program exits, it is treated as an error.
+// Exit says which exit modes should be considered as errors/OK.
 // Returns a non-symbolized crash report, or nil if no error happens.
-func MonitorExecution(outc <-chan []byte, errc <-chan error, reporter report.Reporter, canExit bool) (
-	rep *report.Report) {
-	var output []byte
-	waitForOutput := func() {
-		timer := time.NewTimer(10 * time.Second).C
-		for {
-			select {
-			case out, ok := <-outc:
-				if !ok {
-					return
-				}
-				output = append(output, out...)
-			case <-timer:
-				return
-			}
-		}
+func (inst *Instance) MonitorExecution(outc <-chan []byte, errc <-chan error,
+	reporter report.Reporter, exit ExitCondition) (rep *report.Report) {
+	mon := &monitor{
+		inst:     inst,
+		outc:     outc,
+		errc:     errc,
+		reporter: reporter,
+		exit:     exit,
 	}
-
-	matchPos := 0
-	const (
-		beforeContext = 1024 << 10
-		afterContext  = 128 << 10
-	)
-	extractError := func(defaultError string) *report.Report {
-		// Give it some time to finish writing the error message.
-		waitForOutput()
-		if bytes.Contains(output, []byte("SYZ-FUZZER: PREEMPTED")) {
-			return nil
-		}
-		if !reporter.ContainsCrash(output[matchPos:]) {
-			if defaultError == "" {
-				if canExit {
-					return nil
-				}
-				defaultError = "lost connection to test machine"
-			}
-			rep := &report.Report{
-				Title:  defaultError,
-				Output: output,
-			}
-			return rep
-		}
-		rep := reporter.Parse(output[matchPos:])
-		if rep == nil {
-			panic(fmt.Sprintf("reporter.ContainsCrash/Parse disagree:\n%s", output[matchPos:]))
-		}
-		start := matchPos + rep.StartPos - beforeContext
-		if start < 0 {
-			start = 0
-		}
-		end := matchPos + rep.EndPos + afterContext
-		if end > len(output) {
-			end = len(output)
-		}
-		rep.Output = output[start:end]
-		rep.StartPos += matchPos - start
-		rep.EndPos += matchPos - start
-		return rep
-	}
-
 	lastExecuteTime := time.Now()
-	ticker := time.NewTimer(3 * time.Minute)
-	tickerFired := false
+	ticker := time.NewTicker(tickerPeriod)
+	defer ticker.Stop()
 	for {
-		if !tickerFired && !ticker.Stop() {
-			<-ticker.C
-		}
-		tickerFired = false
-		ticker.Reset(3 * time.Minute)
 		select {
 		case err := <-errc:
 			switch err {
 			case nil:
 				// The program has exited without errors,
 				// but wait for kernel output in case there is some delayed oops.
-				return extractError("")
+				crash := ""
+				if mon.exit&ExitNormal == 0 {
+					crash = lostConnectionCrash
+				}
+				return mon.extractError(crash)
 			case ErrTimeout:
+				if mon.exit&ExitTimeout == 0 {
+					return mon.extractError(timeoutCrash)
+				}
 				return nil
 			default:
 				// Note: connection lost can race with a kernel oops message.
 				// In such case we want to return the kernel oops.
-				return extractError("lost connection to test machine")
-			}
-		case out := <-outc:
-			output = append(output, out...)
-			// syz-fuzzer output
-			if bytes.Contains(output[matchPos:], []byte("executing program")) {
-				lastExecuteTime = time.Now()
-			}
-			// syz-execprog output
-			if bytes.Contains(output[matchPos:], []byte("executed programs:")) {
-				lastExecuteTime = time.Now()
-			}
-			if reporter.ContainsCrash(output[matchPos:]) {
-				return extractError("unknown error")
-			}
-			if len(output) > 2*beforeContext {
-				copy(output, output[len(output)-beforeContext:])
-				output = output[:beforeContext]
-			}
-			matchPos = len(output) - 512
-			if matchPos < 0 {
-				matchPos = 0
-			}
-			// In some cases kernel episodically prints something to console,
-			// but fuzzer is not actually executing programs.
-			// We intentionally produce the same title as no output at all,
-			// because frequently it's the same condition.
-			if time.Since(lastExecuteTime) > 3*time.Minute {
-				rep := &report.Report{
-					Title:  "no output from test machine",
-					Output: output,
+				crash := ""
+				if mon.exit&ExitError == 0 {
+					crash = lostConnectionCrash
 				}
-				return rep
+				return mon.extractError(crash)
+			}
+		case out, ok := <-outc:
+			if !ok {
+				outc = nil
+				continue
+			}
+			lastPos := len(mon.output)
+			mon.output = append(mon.output, out...)
+			if bytes.Contains(mon.output[lastPos:], executingProgram1) ||
+				bytes.Contains(mon.output[lastPos:], executingProgram2) {
+				lastExecuteTime = time.Now()
+			}
+			if reporter.ContainsCrash(mon.output[mon.matchPos:]) {
+				return mon.extractError("unknown error")
+			}
+			if len(mon.output) > 2*beforeContext {
+				copy(mon.output, mon.output[len(mon.output)-beforeContext:])
+				mon.output = mon.output[:beforeContext]
+			}
+			mon.matchPos = len(mon.output) - maxErrorLength
+			if mon.matchPos < 0 {
+				mon.matchPos = 0
 			}
 		case <-ticker.C:
-			tickerFired = true
+			// Detect both "not output whatsoever" and "kernel episodically prints
+			// something to console, but fuzzer is not actually executing programs".
+			// The timeout used to be 3 mins for a long time.
+			// But (1) we were seeing flakes on linux where net namespace
+			// destruction can be really slow, and (2) gVisor watchdog timeout
+			// is 3 mins + 1/4 of that for checking period = 3m45s.
+			// Current linux max timeout is CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=140
+			// and workqueue.watchdog_thresh=140 which both actually result
+			// in 140-280s detection delay.
+			// So the current timeout is 5 mins (300s).
+			// We don't want it to be too long too because it will waste time on real hangs.
+			if time.Since(lastExecuteTime) < noOutputTimeout {
+				break
+			}
+			diag, wait := inst.Diagnose()
+			if len(diag) > 0 {
+				mon.output = append(mon.output, "DIAGNOSIS:\n"...)
+				mon.output = append(mon.output, diag...)
+			}
+			if wait {
+				mon.waitForOutput()
+			}
 			rep := &report.Report{
-				Title:  "no output from test machine",
-				Output: output,
+				Title:      noOutputCrash,
+				Output:     mon.output,
+				Suppressed: report.IsSuppressed(mon.reporter, mon.output),
 			}
 			return rep
 		case <-Shutdown:
@@ -233,3 +246,107 @@ func MonitorExecution(outc <-chan []byte, errc <-chan error, reporter report.Rep
 		}
 	}
 }
+
+type monitor struct {
+	inst     *Instance
+	outc     <-chan []byte
+	errc     <-chan error
+	reporter report.Reporter
+	exit     ExitCondition
+	output   []byte
+	matchPos int
+}
+
+func (mon *monitor) extractError(defaultError string) *report.Report {
+	if defaultError != "" {
+		// N.B. we always wait below for other errors.
+		diag, _ := mon.inst.Diagnose()
+		if len(diag) > 0 {
+			mon.output = append(mon.output, "DIAGNOSIS:\n"...)
+			mon.output = append(mon.output, diag...)
+		}
+	}
+	// Give it some time to finish writing the error message.
+	mon.waitForOutput()
+	if bytes.Contains(mon.output, []byte(fuzzerPreemptedStr)) {
+		return nil
+	}
+	if !mon.reporter.ContainsCrash(mon.output[mon.matchPos:]) {
+		if defaultError == "" {
+			return nil
+		}
+		rep := &report.Report{
+			Title:      defaultError,
+			Output:     mon.output,
+			Suppressed: report.IsSuppressed(mon.reporter, mon.output),
+		}
+		return rep
+	}
+	if defaultError == "" {
+		diag, wait := mon.inst.Diagnose()
+		if len(diag) > 0 {
+			mon.output = append(mon.output, "DIAGNOSIS:\n"...)
+			mon.output = append(mon.output, diag...)
+		}
+		if wait {
+			mon.waitForOutput()
+		}
+	}
+	rep := mon.reporter.Parse(mon.output[mon.matchPos:])
+	if rep == nil {
+		panic(fmt.Sprintf("reporter.ContainsCrash/Parse disagree:\n%s", mon.output[mon.matchPos:]))
+	}
+	start := mon.matchPos + rep.StartPos - beforeContext
+	if start < 0 {
+		start = 0
+	}
+	end := mon.matchPos + rep.EndPos + afterContext
+	if end > len(mon.output) {
+		end = len(mon.output)
+	}
+	rep.Output = mon.output[start:end]
+	rep.StartPos += mon.matchPos - start
+	rep.EndPos += mon.matchPos - start
+	return rep
+}
+
+func (mon *monitor) waitForOutput() {
+	timer := time.NewTimer(waitForOutputTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case out, ok := <-mon.outc:
+			if !ok {
+				return
+			}
+			mon.output = append(mon.output, out...)
+		case <-timer.C:
+			return
+		case <-Shutdown:
+			return
+		}
+	}
+}
+
+const (
+	maxErrorLength = 512
+
+	lostConnectionCrash  = "lost connection to test machine"
+	noOutputCrash        = "no output from test machine"
+	timeoutCrash         = "timed out"
+	executingProgramStr1 = "executing program"  // syz-fuzzer output
+	executingProgramStr2 = "executed programs:" // syz-execprog output
+	fuzzerPreemptedStr   = "SYZ-FUZZER: PREEMPTED"
+)
+
+var (
+	executingProgram1 = []byte(executingProgramStr1)
+	executingProgram2 = []byte(executingProgramStr2)
+
+	beforeContext = 1024 << 10
+	afterContext  = 128 << 10
+
+	tickerPeriod         = 10 * time.Second
+	noOutputTimeout      = 5 * time.Minute
+	waitForOutputTimeout = 10 * time.Second
+)

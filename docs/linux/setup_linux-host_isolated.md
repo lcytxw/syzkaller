@@ -53,27 +53,7 @@ Host *
 Before fuzzing, connect to the machine and keep the connection open so all scp
 and ssh usage will reuse it.
 
-## Go
-
-Install Go 1.8.1:
-``` bash
-wget https://storage.googleapis.com/golang/go1.8.1.linux-amd64.tar.gz
-tar -xf go1.8.1.linux-amd64.tar.gz
-mv go goroot
-export GOROOT=`pwd`/goroot
-export PATH=$PATH:$GOROOT/bin
-mkdir gopath
-export GOPATH=`pwd`/gopath
-```
-
 ## Syzkaller
-
-Get and build syzkaller:
-``` bash
-go get -u -d github.com/google/syzkaller/...
-cd gopath/src/github.com/google/syzkaller/
-make
-```
 
 Use the following config:
 ```
@@ -83,14 +63,14 @@ Use the following config:
 	"rpc": "127.0.0.1:0",
 	"sshkey" : "/path/to/optional/sshkey",
 	"workdir": "/syzkaller/workdir",
-	"vmlinux": "/linux-next/vmlinux",
+	"kernel_obj": "/linux-next",
 	"syzkaller": "/go/src/github.com/google/syzkaller",
 	"sandbox": "setuid",
 	"type": "isolated",
 	"vm": {
 		"targets" : [ "10.0.0.1" ],
 		"target_dir" : "/home/user/tmp/syzkaller",
-                "target_reboot" : false,
+                "target_reboot" : false
 	}
 }
 ```
@@ -98,7 +78,7 @@ Use the following config:
 Don't forget to update:
  - `target` (target OS/arch)
  - `workdir` (path to the workdir)
- - `vmlinux` (path to the `vmlinux` binary)
+ - `kernel_obj` (path to kernel build directory)
  - `sshkey` You can setup an sshkey (optional)
  - `vm.targets` List of hosts to use for fufzzing
  - `vm.target_dir` Working directory on the target host

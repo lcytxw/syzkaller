@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 )
 
@@ -43,7 +44,7 @@ func TestMutateRandom(t *testing.T) {
 				if bytes.Equal(data, data1) {
 					continue
 				}
-				if _, err := target.Deserialize(data1); err != nil {
+				if _, err := target.Deserialize(data1, NonStrict); err != nil {
 					t.Fatalf("Deserialize failed after Mutate: %v\n%s", err, data1)
 				}
 				continue next
@@ -105,7 +106,7 @@ mutate1()
 		{`
 mutate4(&(0x7f0000000000)="11223344", 0x4)
 `, `
-mutate4(&(0x7f0000000000)="112244", 0x3)
+mutate4(&(0x7f0000000000)="113344", 0x3)
 `},
 		// Mutate data (insert byte and update size).
 		// TODO: this is not working, because Mutate constantly tends
@@ -154,11 +155,11 @@ mutate8(0xffffffffffffffff)
 		test := test
 		t.Run(fmt.Sprint(ti), func(t *testing.T) {
 			t.Parallel()
-			p, err := target.Deserialize([]byte(test[0]))
+			p, err := target.Deserialize([]byte(test[0]), Strict)
 			if err != nil {
 				t.Fatalf("failed to deserialize original program: %v", err)
 			}
-			goal, err := target.Deserialize([]byte(test[1]))
+			goal, err := target.Deserialize([]byte(test[1]), Strict)
 			if err != nil {
 				t.Fatalf("failed to deserialize goal program: %v", err)
 			}
@@ -194,10 +195,10 @@ func BenchmarkMutate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	prios := target.CalculatePriorities(nil)
-	ct := target.BuildChoiceTable(prios, nil)
+	ct := linuxAmd64ChoiceTable(target)
 	const progLen = 30
 	p := target.Generate(rand.NewSource(0), progLen, nil)
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		rs := rand.NewSource(0)
 		for pb.Next() {
@@ -214,13 +215,25 @@ func BenchmarkGenerate(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	prios := target.CalculatePriorities(nil)
-	ct := target.BuildChoiceTable(prios, nil)
+	ct := linuxAmd64ChoiceTable(target)
 	const progLen = 30
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		rs := rand.NewSource(0)
 		for pb.Next() {
 			target.Generate(rs, progLen, ct)
 		}
 	})
+}
+
+var (
+	linuxCTOnce sync.Once
+	linuxCT     *ChoiceTable
+)
+
+func linuxAmd64ChoiceTable(target *Target) *ChoiceTable {
+	linuxCTOnce.Do(func() {
+		linuxCT = target.BuildChoiceTable(target.CalculatePriorities(nil), nil)
+	})
+	return linuxCT
 }

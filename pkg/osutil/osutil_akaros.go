@@ -13,7 +13,8 @@ import (
 func HandleInterrupts(shutdown chan struct{}) {
 }
 
-func UmountAll(dir string) {
+func RemoveAll(dir string) error {
+	return os.RemoveAll(dir)
 }
 
 func prolongPipe(r, w *os.File) {
@@ -28,4 +29,7 @@ func SandboxChown(file string) error {
 }
 
 func setPdeathsig(cmd *exec.Cmd) {
+}
+
+func killPgroup(cmd *exec.Cmd) {
 }

@@ -12,10 +12,14 @@ import (
 
 func TestIsComplexPtr(t *testing.T) {
 	target, rs, _ := initRandomTargetTest(t, "linux", "amd64")
+	iters := 10
+	if testing.Short() {
+		iters = 1
+	}
 	r := newRand(target, rs)
 	compl := make(map[string]bool)
 	for _, meta := range target.Syscalls {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < iters; i++ {
 			s := newState(target, nil)
 			calls := r.generateParticularCall(s, meta)
 			p := &Prog{Target: target, Calls: calls}
@@ -34,6 +38,7 @@ func TestIsComplexPtr(t *testing.T) {
 
 func TestSquash(t *testing.T) {
 	target := initTargetTest(t, "test", "64")
+	// nolint: lll
 	tests := []struct {
 		prog     string
 		squashed string
@@ -45,7 +50,7 @@ func TestSquash(t *testing.T) {
 	}
 	for i, test := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			p, err := target.Deserialize([]byte(test.prog))
+			p, err := target.Deserialize([]byte(test.prog), Strict)
 			if err != nil {
 				t.Fatalf("failed to deserialize prog: %v", err)
 			}

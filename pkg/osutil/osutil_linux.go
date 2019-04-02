@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,43 +20,71 @@ import (
 	"unsafe"
 )
 
-// UmountAll recurusively unmounts all mounts in dir.
-func UmountAll(dir string) {
+// RemoveAll is similar to os.RemoveAll, but can handle more cases.
+func RemoveAll(dir string) error {
 	files, _ := ioutil.ReadDir(dir)
 	for _, f := range files {
 		name := filepath.Join(dir, f.Name())
 		if f.IsDir() {
-			UmountAll(name)
+			RemoveAll(name)
 		}
 		fn := []byte(name + "\x00")
 		syscall.Syscall(syscall.SYS_UMOUNT2, uintptr(unsafe.Pointer(&fn[0])), syscall.MNT_FORCE, 0)
 	}
+	if err := os.RemoveAll(dir); err != nil {
+		removeImmutable(dir)
+		return os.RemoveAll(dir)
+	}
+	return nil
+}
+
+func removeImmutable(fname string) error {
+	// Reset FS_XFLAG_IMMUTABLE/FS_XFLAG_APPEND.
+	fd, err := syscall.Open(fname, syscall.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	flags := 0
+	var cmd uint64 // FS_IOC_SETFLAGS
+	switch runtime.GOARCH {
+	case "386", "arm":
+		cmd = 1074030082
+	case "amd64", "arm64":
+		cmd = 1074292226
+	case "ppc64le":
+		cmd = 2148034050
+	default:
+		panic("unknown arch")
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(unsafe.Pointer(&flags)))
+	return errno
 }
 
 func Sandbox(cmd *exec.Cmd, user, net bool) error {
+	enabled, uid, gid, err := initSandbox()
+	if err != nil || !enabled {
+		return err
+	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = new(syscall.SysProcAttr)
-	}
-	if user {
-		uid, gid, err := initSandbox()
-		if err != nil {
-			return err
-		}
-		cmd.SysProcAttr.Credential = &syscall.Credential{
-			Uid: uid,
-			Gid: gid,
-		}
 	}
 	if net {
 		cmd.SysProcAttr.Cloneflags = syscall.CLONE_NEWNET | syscall.CLONE_NEWIPC |
 			syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID
 	}
+	if user {
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: uid,
+			Gid: gid,
+		}
+	}
 	return nil
 }
 
 func SandboxChown(file string) error {
-	uid, gid, err := initSandbox()
-	if err != nil {
+	enabled, uid, gid, err := initSandbox()
+	if err != nil || !enabled {
 		return err
 	}
 	return os.Chown(file, int(uid), int(gid))
@@ -63,13 +92,18 @@ func SandboxChown(file string) error {
 
 var (
 	sandboxOnce     sync.Once
+	sandboxEnabled  = true
 	sandboxUsername = "syzkaller"
 	sandboxUID      = ^uint32(0)
 	sandboxGID      = ^uint32(0)
 )
 
-func initSandbox() (uint32, uint32, error) {
+func initSandbox() (bool, uint32, uint32, error) {
 	sandboxOnce.Do(func() {
+		if syscall.Getuid() != 0 || os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
+			sandboxEnabled = false
+			return
+		}
 		uid, err := usernameToID("-u")
 		if err != nil {
 			return
@@ -81,10 +115,10 @@ func initSandbox() (uint32, uint32, error) {
 		sandboxUID = uid
 		sandboxGID = gid
 	})
-	if sandboxUID == ^uint32(0) {
-		return 0, 0, fmt.Errorf("user %q is not found, can't sandbox command", sandboxUsername)
+	if sandboxEnabled && sandboxUID == ^uint32(0) {
+		return false, 0, 0, fmt.Errorf("user %q is not found, can't sandbox command", sandboxUsername)
 	}
-	return sandboxUID, sandboxGID, nil
+	return sandboxEnabled, sandboxUID, sandboxGID, nil
 }
 
 func usernameToID(what string) (uint32, error) {
@@ -105,6 +139,12 @@ func setPdeathsig(cmd *exec.Cmd) {
 		cmd.SysProcAttr = new(syscall.SysProcAttr)
 	}
 	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+	// We will kill the whole process group.
+	cmd.SysProcAttr.Setpgid = true
+}
+
+func killPgroup(cmd *exec.Cmd) {
+	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
 func prolongPipe(r, w *os.File) {

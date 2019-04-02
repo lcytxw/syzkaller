@@ -1,8 +1,7 @@
 # Copyright 2017 syzkaller project authors. All rights reserved.
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-# There are 4 OS/arch pairs:
-#  - BUILDOS/BUILDARCH: the current machine's pair used for build.
+# There are 3 OS/arch pairs:
 #  - HOSTOS/HOSTARCH: pair where syz-manager will run.
 #  - TARGETOS/TARGETVMARCH: pair of the target OS under test.
 #  - TARGETOS/TARGETARCH: pair of the target test process.
@@ -21,59 +20,33 @@
 # (you don't need this unless you update system call descriptions):
 #    make extract TARGETOS=android SOURCEDIR=/path/to/android/checkout
 
-BUILDOS := $(shell go env GOOS)
-BUILDARCH := $(shell go env GOARCH)
-HOSTOS ?= $(BUILDOS)
-HOSTARCH ?= $(BUILDARCH)
-TARGETOS ?= $(HOSTOS)
-TARGETARCH ?= $(HOSTARCH)
-TARGETVMARCH ?= $(TARGETARCH)
-GO := go
-EXE :=
+define newline
 
-ifeq ("$(TARGETARCH)", "amd64")
-	CC = "x86_64-linux-gnu-gcc"
-else ifeq ("$(TARGETARCH)", "386")
-	CC = "x86_64-linux-gnu-gcc"
-	ADDCFLAGS = "-m32"
-else ifeq ("$(TARGETARCH)", "arm64")
-	CC = "aarch64-linux-gnu-gcc"
-else ifeq ("$(TARGETARCH)", "arm")
-	CC = "arm-linux-gnueabihf-gcc"
-	ADDCFLAGS = "-march=armv6t2"
-else ifeq ("$(TARGETARCH)", "ppc64le")
-	CC = "powerpc64le-linux-gnu-gcc"
+
+endef
+ENV := $(subst \n,$(newline),$(shell \
+	SOURCEDIR=$(SOURCEDIR) HOSTOS=$(HOSTOS) HOSTARCH=$(HOSTARCH) \
+	TARGETOS=$(TARGETOS) TARGETARCH=$(TARGETARCH) TARGETVMARCH=$(TARGETVMARCH) \
+	go run tools/syz-env/env.go))
+$(info $(ENV))
+$(eval $(ENV))
+ifeq ("$(NCORES)", "")
+$(error syz-env failed)
 endif
+MAKEFLAGS += " -j$(NCORES) "
+export MAKEFLAGS
 
+GO := go
+HOSTGO := go
 # By default, build all Go binaries as static. We don't need cgo and it is
 # known to cause problems at least on Android emulator.
 export CGO_ENABLED=0
+TARGETGOOS := $(TARGETOS)
+TARGETGOARCH := $(TARGETVMARCH)
 
 ifeq ("$(TARGETOS)", "fuchsia")
 	# SOURCEDIR should point to fuchsia checkout.
-	GO = $(SOURCEDIR)/buildtools/go
-	CC = $(SOURCEDIR)/buildtools/linux-x64/clang/bin/clang++
-	export CGO_ENABLED=1
-	NOSTATIC = 1
-	ifeq ("$(TARGETARCH)", "amd64")
-		ADDCFLAGS = --target=x86_64-fuchsia -lfdio -lzircon --sysroot $(SOURCEDIR)/out/build-zircon/build-user-x86-64/sysroot -I $(SOURCEDIR)/out/build-zircon/build-user-x86-64
-		export ZIRCON_BUILD_DIR=$(SOURCEDIR)/out/build-zircon/build-user-x86-64
-	else ifeq ("$(TARGETARCH)", "arm64")
-		ADDCFLAGS = --target=aarch64-fuchsia -lfdio -lzircon --sysroot $(SOURCEDIR)/out/build-zircon/build-user-arm64/sysroot -I $(SOURCEDIR)/out/build-zircon/build-user-arm64
-		export ZIRCON_BUILD_DIR=$(SOURCEDIR)/out/build-zircon/build-user-arm64
-	endif
-endif
-
-ifeq ("$(TARGETOS)", "akaros")
-	# SOURCEDIR should point to bootstrapped akaros checkout.
-	# There is no up-to-date Go for akaros, so building Go will fail.
-	CC = $(SOURCEDIR)/install/x86_64-ucb-akaros-gcc/bin/x86_64-ucb-akaros-g++
-	# Most likely this is incorrect (why doesn't it know own sysroot?), but worked for me.
-	ADDCFLAGS = -I $(SOURCEDIR)/tools/compilers/gcc-glibc/x86_64-ucb-akaros-gcc-stage3-builddir/x86_64-ucb-akaros/libstdc++-v3/include/x86_64-ucb-akaros -I $(SOURCEDIR)/tools/compilers/gcc-glibc/x86_64-ucb-akaros-gcc-stage3-builddir/x86_64-ucb-akaros/libstdc++-v3/include -I $(SOURCEDIR)/tools/compilers/gcc-glibc/gcc-4.9.2/libstdc++-v3/libsupc++ -L $(SOURCEDIR)/tools/compilers/gcc-glibc/x86_64-ucb-akaros-gcc-stage3-builddir/x86_64-ucb-akaros/libstdc++-v3/src/.libs
-endif
-
-ifeq ("$(TARGETOS)", "windows")
-	EXE = .exe
+	GO = "$(SOURCEDIR)/scripts/devshell/go"
 endif
 
 GITREV=$(shell git rev-parse HEAD)
@@ -82,165 +55,294 @@ ifeq ("$(shell git diff --shortstat)", "")
 else
 	REV=$(GITREV)+
 endif
-
-NOSTATIC ?= 0
-ifeq ($(NOSTATIC), 0)
-	ADDCFLAGS += -static
-endif
+GITREVDATE=$(shell git log -n 1 --format="%ad")
 
 # Don't generate symbol table and DWARF debug info.
 # Reduces build time and binary sizes considerably.
 # That's only needed if you use gdb or nm.
 # If you need that, build manually without these flags.
-GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/sys.GitRevision=$(REV)"
+GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/sys.GitRevision=$(REV) -X 'github.com/google/syzkaller/sys.gitRevisionDate=$(GITREVDATE)'"
+
+GOHOSTFLAGS := $(GOFLAGS)
+GOTARGETFLAGS := $(GOFLAGS)
 ifneq ("$(GOTAGS)", "")
-	GOFLAGS += "-tags=$(GOTAGS)"
+	GOHOSTFLAGS += "-tags=$(GOTAGS)"
+endif
+GOTARGETFLAGS += "-tags=syz_target syz_os_$(TARGETOS) syz_arch_$(TARGETVMARCH) $(GOTAGS)"
+
+ifeq ("$(TARGETOS)", "test")
+	TARGETGOOS := $(HOSTOS)
+	TARGETGOARCH := $(HOSTARCH)
+endif
+
+ifeq ("$(TARGETOS)", "akaros")
+	TARGETGOOS := $(HOSTOS)
+	TARGETGOARCH := $(HOSTARCH)
+endif
+
+ifeq ("$(TARGETOS)", "trusty")
+	TARGETGOOS := $(HOSTOS)
+	TARGETGOARCH := $(HOSTARCH)
 endif
 
 .PHONY: all host target \
-	manager fuzzer executor \
+	manager runtest fuzzer executor \
 	ci hub \
-	execprog mutate prog2c stress repro upgrade db parse \
+	execprog mutate prog2c trace2syz stress repro upgrade db \
 	bin/syz-sysgen bin/syz-extract bin/syz-fmt \
-	extract generate \
-	format tidy test check_links check_diff arch presubmit clean
+	extract generate generate_go generate_sys \
+	format format_go format_cpp format_sys \
+	tidy test test_race check_links check_diff \
+	arch arch_darwin_amd64_host arch_linux_amd64_host \
+	arch_freebsd_amd64_host arch_netbsd_amd64_host \
+	arch_linux_amd64_target arch_linux_386_target \
+	arch_linux_arm64_target arch_linux_arm_target arch_linux_ppc64le_target \
+	arch_freebsd_amd64_target arch_netbsd_amd64_target arch_windows_amd64_target \
+	arch_test presubmit presubmit_parallel clean
 
 all: host target
 
 host:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) install ./syz-manager
-	$(MAKE) manager repro mutate prog2c db parse upgrade
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) install ./syz-manager
+	$(MAKE) manager runtest repro mutate prog2c db upgrade
 
 target:
-	GOOS=$(TARGETOS) GOARCH=$(TARGETVMARCH) $(GO) install ./syz-fuzzer
+	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) install ./syz-fuzzer
 	$(MAKE) fuzzer execprog stress executor
 
 # executor uses stacks of limited size, so no jumbo frames.
 executor:
+ifneq ("$(BUILDOS)", "$(NATIVEBUILDOS)")
+	$(info ************************************************************************************)
+	$(info Building executor for ${TARGETOS} is not supported on ${BUILDOS}. Executor will not be built.)
+	$(info ************************************************************************************)
+else
+ifneq ("$(NO_CROSS_COMPILER)", "")
+	$(info ************************************************************************************)
+	$(info Native cross-compiler $(CC) is missing. Executor will not be built.)
+	$(info ************************************************************************************)
+else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
-	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor_$(TARGETOS).cc \
-		-pthread -Wall -Wframe-larger-than=8192 -Wparentheses -Werror -O2 \
-		$(ADDCFLAGS) $(CFLAGS) -DGOOS=\"$(TARGETOS)\" -DGIT_REVISION=\"$(REV)\"
+	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
+		$(ADDCFLAGS) $(CFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
+endif
+endif
 
 manager:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
+
+runtest:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-runtest github.com/google/syzkaller/tools/syz-runtest
 
 fuzzer:
-	GOOS=$(TARGETOS) GOARCH=$(TARGETVMARCH) $(GO) build $(GOFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-fuzzer$(EXE) github.com/google/syzkaller/syz-fuzzer
+	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-fuzzer$(EXE) github.com/google/syzkaller/syz-fuzzer
 
 execprog:
-	GOOS=$(TARGETOS) GOARCH=$(TARGETVMARCH) $(GO) build $(GOFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-execprog$(EXE) github.com/google/syzkaller/tools/syz-execprog
+	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-execprog$(EXE) github.com/google/syzkaller/tools/syz-execprog
 
 ci:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-ci github.com/google/syzkaller/syz-ci
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-ci github.com/google/syzkaller/syz-ci
 
 hub:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-hub github.com/google/syzkaller/syz-hub
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-hub github.com/google/syzkaller/syz-hub
 
 repro:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-repro github.com/google/syzkaller/tools/syz-repro
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-repro github.com/google/syzkaller/tools/syz-repro
 
 mutate:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-mutate github.com/google/syzkaller/tools/syz-mutate
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-mutate github.com/google/syzkaller/tools/syz-mutate
 
 prog2c:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-prog2c github.com/google/syzkaller/tools/syz-prog2c
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-prog2c github.com/google/syzkaller/tools/syz-prog2c
 
 stress:
-	GOOS=$(TARGETOS) GOARCH=$(TARGETVMARCH) $(GO) build $(GOFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-stress$(EXE) github.com/google/syzkaller/tools/syz-stress
+	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-stress$(EXE) github.com/google/syzkaller/tools/syz-stress
 
 db:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-db github.com/google/syzkaller/tools/syz-db
-
-parse:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-parse github.com/google/syzkaller/tools/syz-parse
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-db github.com/google/syzkaller/tools/syz-db
 
 upgrade:
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(GO) build $(GOFLAGS) -o ./bin/syz-upgrade github.com/google/syzkaller/tools/syz-upgrade
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-upgrade github.com/google/syzkaller/tools/syz-upgrade
 
+trace2syz:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-trace2syz github.com/google/syzkaller/tools/syz-trace2syz
+
+# `extract` extracts const files from various kernel sources, and may only
+# re-generate parts of files.
 extract: bin/syz-extract
-	bin/syz-extract -build -os=$(TARGETOS) -sourcedir=$(SOURCEDIR)
+ifeq ($(TARGETOS),fuchsia)
+	$(MAKE) generate_fidl TARGETARCH=amd64
+	$(MAKE) generate_fidl TARGETARCH=arm64
+else
+endif
+	bin/syz-extract -build -os=$(TARGETOS) -sourcedir=$(SOURCEDIR) $(FILES)
 bin/syz-extract:
-	$(GO) build $(GOFLAGS) -o $@ ./sys/syz-extract
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o $@ ./sys/syz-extract
 
-generate: bin/syz-sysgen
-	bin/syz-sysgen
-	$(GO) generate ./pkg/csource ./executor ./pkg/ifuzz ./pkg/kernel
+# `generate` does *not* depend on any kernel sources, and generates everything
+# in one pass, for all arches. It can be run on a bare syzkaller checkout.
+generate: generate_go generate_sys
 	$(MAKE) format
-bin/syz-sysgen:
-	$(GO) build $(GOFLAGS) -o $@ ./sys/syz-sysgen
 
-format: bin/syz-fmt
+generate_go: bin/syz-sysgen format_cpp
+	$(GO) generate ./pkg/csource ./executor ./pkg/ifuzz ./pkg/build ./pkg/html
+
+generate_sys: bin/syz-sysgen
+	bin/syz-sysgen
+
+generate_fidl:
+ifeq ($(TARGETOS),fuchsia)
+	$(HOSTGO) generate ./sys/fuchsia
+	$(MAKE) format_sys
+else
+endif
+
+generate_trace2syz:
+	(cd tools/syz-trace2syz/parser; ragel -Z -G2 -o lex.go straceLex.rl)
+	(cd tools/syz-trace2syz/parser; goyacc -o strace.go -p Strace -v="" strace.y)
+
+bin/syz-sysgen:
+	$(GO) build $(GOHOSTFLAGS) -o $@ ./sys/syz-sysgen
+
+format: format_go format_cpp format_sys
+
+format_go:
 	$(GO) fmt ./...
+
+format_cpp:
 	clang-format --style=file -i executor/*.cc executor/*.h tools/kcovtrace/*.c
-	bin/syz-fmt sys/test
-	bin/syz-fmt sys/akaros
-	bin/syz-fmt sys/freebsd
-	bin/syz-fmt sys/netbsd
-	bin/syz-fmt sys/linux
-	bin/syz-fmt sys/fuchsia
-	bin/syz-fmt sys/windows
+
+format_sys: bin/syz-fmt
+	bin/syz-fmt all
+
 bin/syz-fmt:
-	$(GO) build $(GOFLAGS) -o $@ ./tools/syz-fmt
+	$(HOSTGO) build $(GOHOSTFLAGS) -o $@ ./tools/syz-fmt
 
 tidy:
 	# A single check is enabled for now. But it's always fixable and proved to be useful.
-	clang-tidy -quiet -header-filter=.* -checks=-*,misc-definitions-in-headers -warnings-as-errors=* executor/*.cc
+	clang-tidy -quiet -header-filter=.* -checks=-*,misc-definitions-in-headers -warnings-as-errors=* \
+		-extra-arg=-DGOOS_$(TARGETOS)=1 -extra-arg=-DGOARCH_$(TARGETARCH)=1 \
+		executor/*.cc
 	# Just check for compiler warnings.
 	$(CC) executor/test_executor.cc -c -o /dev/null -Wparentheses -Wno-unused -Wall
 
-test:
-	# Executor tests use cgo.
-	env CGO_ENABLED=1 $(GO) test -short ./...
-	env CGO_ENABLED=1 $(GO) test -short -race -bench=.* ./...
+gometalinter:
+ifeq ($(TRAVIS),)
+	env CGO_ENABLED=1 gometalinter.v2 ./...
+else
+	# GOMAXPROCS/GOGC settings help to reduce memory usage,
+	# otherwise this gets OOM-killed on travis.
+	env CGO_ENABLED=1 GOMAXPROCS=1 GOGC=50 gometalinter.v2 ./...
+endif
 
-arch:
-	env GOOG=darwin GOARCH=amd64 go install github.com/google/syzkaller/syz-manager
+arch: arch_darwin_amd64_host arch_linux_amd64_host arch_freebsd_amd64_host \
+	arch_netbsd_amd64_host arch_openbsd_amd64_host \
+	arch_linux_amd64_target arch_linux_386_target \
+	arch_linux_arm64_target arch_linux_arm_target arch_linux_ppc64le_target \
+	arch_freebsd_amd64_target arch_netbsd_amd64_target arch_openbsd_amd64_target \
+	arch_windows_amd64_target arch_test
+
+arch_darwin_amd64_host:
 	env HOSTOS=darwin HOSTARCH=amd64 $(MAKE) host
-	env GOOG=linux GOARCH=amd64 go install github.com/google/syzkaller/syz-manager
+
+arch_linux_amd64_host:
 	env HOSTOS=linux HOSTARCH=amd64 $(MAKE) host
-	env GOOG=freebsd GOARCH=amd64 go install github.com/google/syzkaller/syz-manager
-	env HOSTOS=freebsd HOSTARCH=amd64 $(MAKE) host
-	env GOOG=netbsd GOARCH=amd64 go install github.com/google/syzkaller/syz-manager
-	env HOSTOS=netbsd HOSTARCH=amd64 $(MAKE) host
-	env GOOG=linux GOARCH=amd64 go install github.com/google/syzkaller/syz-fuzzer
+
+arch_linux_amd64_target:
 	env TARGETOS=linux TARGETARCH=amd64 $(MAKE) target
-	env GOOG=linux GOARCH=arm64 go install github.com/google/syzkaller/syz-fuzzer
-	env TARGETOS=linux TARGETARCH=arm64 $(MAKE) target
-	env GOOG=linux GOARCH=ppc64le go install github.com/google/syzkaller/syz-fuzzer
-	env TARGETOS=linux TARGETARCH=ppc64le $(MAKE) target
-	# executor build on arm fails with:
-	# Error: alignment too large: 15 assumed
-	env GOOG=linux GOARCH=arm64 go install github.com/google/syzkaller/syz-fuzzer
-	env TARGETOS=linux TARGETARCH=arm64 TARGETVMARCH=arm $(MAKE) target
+
+arch_linux_386_target:
 	# executor build on 386 on travis fails with:
 	# fatal error: asm/errno.h: No such file or directory
 	# We install a bunch of additional packages in .travis.yml,
 	# but I can't guess the right one.
-	env GOOG=linux GOARCH=386 go install github.com/google/syzkaller/syz-fuzzer
 	env TARGETOS=linux TARGETARCH=amd64 TARGETVMARCH=386 $(MAKE) target
-	env GOOG=windows GOARCH=amd64 go install github.com/google/syzkaller/syz-fuzzer
-	env TARGETOS=windows TARGETARCH=amd64 $(MAKE) fuzzer execprog stress
-	env GOOG=freebsd GOARCH=amd64 go install github.com/google/syzkaller/syz-fuzzer
+
+arch_linux_arm64_target:
+	env TARGETOS=linux TARGETARCH=arm64 $(MAKE) target
+
+arch_linux_arm_target:
+	# executor build on arm fails with:
+	# Error: alignment too large: 15 assumed
+	env TARGETOS=linux TARGETARCH=arm64 TARGETVMARCH=arm $(MAKE) target
+
+arch_linux_ppc64le_target:
+	env TARGETOS=linux TARGETARCH=ppc64le $(MAKE) target
+
+arch_freebsd_amd64_host:
+	env HOSTOS=freebsd HOSTARCH=amd64 $(MAKE) host
+
+arch_freebsd_amd64_target:
 	env TARGETOS=freebsd TARGETARCH=amd64 $(MAKE) target
-	env GOOG=netbsd GOARCH=amd64 go install github.com/google/syzkaller/syz-fuzzer
+
+arch_netbsd_amd64_host:
+	env HOSTOS=netbsd HOSTARCH=amd64 $(MAKE) host
+
+arch_netbsd_amd64_target:
 	env TARGETOS=netbsd TARGETARCH=amd64 $(MAKE) target
 
+arch_openbsd_amd64_host:
+	env HOSTOS=openbsd HOSTARCH=amd64 $(MAKE) host
+
+arch_openbsd_amd64_target:
+	env TARGETOS=openbsd TARGETARCH=amd64 $(MAKE) target
+
+arch_windows_amd64_target:
+	env GOOG=windows GOARCH=amd64 $(GO) install ./syz-fuzzer
+	env TARGETOS=windows TARGETARCH=amd64 $(MAKE) target
+
+arch_test:
+	env TARGETOS=test TARGETARCH=64 $(MAKE) executor
+	env TARGETOS=test TARGETARCH=64_fork $(MAKE) executor
+	# 32-bit build fails on travis with:
+	# /usr/include/c++/4.8/utility:68:28: fatal error: bits/c++config.h: No such file or directory
+	# #include <bits/c++config.h>
+	# env TARGETOS=test TARGETARCH=32_shmem $(MAKE) executor
+	# env TARGETOS=test TARGETARCH=32_fork_shmem $(MAKE) executor
+
 presubmit:
-	$(MAKE) check_links
 	$(MAKE) generate
-	$(MAKE) all
-	$(MAKE) arch
 	$(MAKE) check_diff
-	$(MAKE) test
+	$(GO) install ./...
+	$(MAKE) presubmit_parallel
+	$(MAKE) gometalinter
 	echo LGTM
+
+presubmit_parallel: test test_race arch check_links
+
+test:
+ifeq ("$(TRAVIS)$(shell go version | grep 1.11)", "true")
+	# Collect coverage report for codecov.io when testing Go 1.12 on travis (uploaded in .travis.yml).
+	env CGO_ENABLED=1 $(GO) test -short -coverprofile=coverage.txt ./...
+else
+	# Executor tests use cgo.
+	env CGO_ENABLED=1 $(GO) test -short ./...
+endif
+
+test_race:
+	env CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
+	env CGO_ENABLED=1 $(GO) test -race -short -bench=.* -benchtime=.2s ./... ;\
+	fi
 
 clean:
 	rm -rf ./bin/
 
-# For a tupical Ubuntu/Debian distribution, requires sudo.
+# For a tupical Ubuntu/Debian distribution.
+# We use "|| true" for apt-get install because packages are all different on different distros,
+# and we want to install at least gometalinter on Travis CI.
 install_prerequisites:
-	apt-get install libc6-dev-i386 lib32stdc++-4.8-dev linux-libc-dev g++-aarch64-linux-gnu g++-powerpc64le-linux-gnu g++-arm-linux-gnueabihf
+	uname -a
+	sudo apt-get update
+	sudo apt-get install -y -q libc6-dev-i386 linux-libc-dev \
+		gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-powerpc64le-linux-gnu || true
+	sudo apt-get install -y -q g++-aarch64-linux-gnu || true
+	sudo apt-get install -y -q g++-powerpc64le-linux-gnu || true
+	sudo apt-get install -y -q g++-arm-linux-gnueabihf || true
+	sudo apt-get install -y -q ragel
+	go get -u golang.org/x/tools/cmd/goyacc
+	go get -u gopkg.in/alecthomas/gometalinter.v2
+	gometalinter.v2 --install
 
 check_links:
 	python ./tools/check_links.py $$(pwd) $$(ls ./*.md; find ./docs/ -name '*.md')

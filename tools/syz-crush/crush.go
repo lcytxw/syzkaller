@@ -8,18 +8,17 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"io/ioutil"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/syz-manager/mgrconfig"
 	"github.com/google/syzkaller/vm"
 )
 
@@ -39,13 +38,11 @@ func main() {
 	if _, err := prog.GetTarget(cfg.TargetOS, cfg.TargetArch); err != nil {
 		log.Fatalf("%v", err)
 	}
-	env := mgrconfig.CreateVMEnv(cfg, false)
-	vmPool, err := vm.Create(cfg.Type, env)
+	vmPool, err := vm.Create(cfg, false)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	reporter, err := report.NewReporter(cfg.TargetOS, cfg.Kernel_Src,
-		filepath.Dir(cfg.Vmlinux), nil, cfg.ParsedIgnores)
+	reporter, err := report.NewReporter(cfg)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -101,8 +98,8 @@ func runInstance(cfg *mgrconfig.Config, reporter report.Reporter, vmPool *vm.Poo
 		return
 	}
 
-	cmd := fmt.Sprintf("%v -executor=%v -repeat=0 -procs=%v -cover=0 -sandbox=%v %v",
-		execprogBin, executorBin, cfg.Procs, cfg.Sandbox, logFile)
+	cmd := instance.ExecprogCmd(execprogBin, executorBin, cfg.TargetOS, cfg.TargetArch, cfg.Sandbox,
+		true, true, true, cfg.Procs, -1, -1, logFile)
 	outc, errc, err := inst.Run(time.Hour, nil, cmd)
 	if err != nil {
 		log.Logf(0, "failed to run execprog: %v", err)
@@ -110,7 +107,7 @@ func runInstance(cfg *mgrconfig.Config, reporter report.Reporter, vmPool *vm.Poo
 	}
 
 	log.Logf(0, "vm-%v: crushing...", index)
-	rep := vm.MonitorExecution(outc, errc, reporter, false)
+	rep := inst.MonitorExecution(outc, errc, reporter, vm.ExitTimeout)
 	if rep == nil {
 		// This is the only "OK" outcome.
 		log.Logf(0, "vm-%v: running long enough, restarting", index)

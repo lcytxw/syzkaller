@@ -5,6 +5,7 @@
 
 include <linux/socket.h>
 include <linux/net.h>
+include <uapi/linux/in6.h>
 include <uapi/linux/rds.h>
 
 resource sock_rds[sock]
@@ -41,6 +42,7 @@ cmsghdr_rds [
 	cswp		cmsghdr_rds_t[RDS_CMSG_ATOMIC_CSWP, rds_atomic_args]
 	mask_fadd	cmsghdr_rds_t[RDS_CMSG_MASKED_ATOMIC_FADD, rds_atomic_args]
 	mask_cswp	cmsghdr_rds_t[RDS_CMSG_MASKED_ATOMIC_CSWP, rds_atomic_args]
+	zcopy_cookie	cmsghdr_rds_t[RDS_CMSG_ZCOPY_COOKIE, int32]
 ] [varlen]
 
 type cmsghdr_rds_t[TYPE, DATA] {

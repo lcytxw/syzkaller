@@ -18,6 +18,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+
+	"github.com/google/syzkaller/pkg/osutil"
 )
 
 var (
@@ -44,10 +46,10 @@ func main() {
 	}
 
 	graphs := []*Graph{
-		&Graph{Name: "coverage"},
-		&Graph{Name: "corpus"},
-		&Graph{Name: "exec total"},
-		&Graph{Name: "crash types"},
+		{Name: "coverage"},
+		{Name: "corpus"},
+		{Name: "exec total"},
+		{Name: "crash types"},
 	}
 	for i, fname := range flag.Args() {
 		data := readFile(fname)
@@ -190,7 +192,7 @@ func display(graphs []*Graph) {
 	}
 	outf.Close()
 	name := outf.Name() + ".html"
-	if err := os.Rename(outf.Name(), name); err != nil {
+	if err := osutil.Rename(outf.Name(), name); err != nil {
 		failf("failed to rename file: %v", err)
 	}
 	if err := exec.Command("xdg-open", name).Start(); err != nil {

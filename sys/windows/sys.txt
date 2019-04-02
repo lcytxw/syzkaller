@@ -6,6 +6,8 @@ include <windows.h>
 resource HANDLE[intptr]: INVALID_HANDLE_VALUE
 resource hFile[HANDLE]
 
+syz_execute_func(text ptr[in, text[target]])
+
 CloseHandle(hObject HANDLE)
 CreateFileA(lpFileName ptr[in, filename], dwDesiredAccess flags[file_access_rights], dwShareMode flags[file_share_mode], lpSecurityAttributes ptr[in, SECURITY_ATTRIBUTES, opt], dwCreationDisposition flags[file_create_disposition], dwFlagsAndAttributes flags[file_attributes], hTemplateFile HANDLE[opt]) hFile
 VirtualAlloc(lpAddress vma, dwSize len[lpAddress], flAllocationType flags[allocation_type], flProtect flags[protect_flags])
@@ -22,7 +24,6 @@ SECURITY_DESCRIPTOR {
 	stub	int32
 }
 
-access_rights = DELETE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER
 file_access_rights = DELETE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_CREATE_PIPE_INSTANCE, FILE_DELETE_CHILD, FILE_EXECUTE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA
 file_share_mode = FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE
 file_create_disposition = CREATE_ALWAYS, CREATE_NEW, OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING

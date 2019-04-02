@@ -5,54 +5,82 @@ package csource
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"runtime"
 
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 )
 
-// Build builds a C/C++ program from source src and returns name of the resulting binary.
-// lang can be "c" or "c++".
-func Build(target *prog.Target, lang, src string) (string, error) {
-	bin, err := ioutil.TempFile("", "syzkaller")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %v", err)
-	}
-	bin.Close()
-	sysTarget := targets.List[target.OS][target.Arch]
-	compiler := sysTarget.CCompilerPrefix + "gcc"
+// Build builds a C program from source src and returns name of the resulting binary.
+func Build(target *prog.Target, src []byte) (string, error) {
+	return build(target, src, "", true)
+}
+
+// BuildNoWarn is the same as Build, but ignores all compilation warnings.
+// Should not be used in tests, but may be used e.g. when we are bisecting and potentially
+// using an old repro with newer compiler, or a compiler that we never seen before.
+// In these cases it's more important to build successfully.
+func BuildNoWarn(target *prog.Target, src []byte) (string, error) {
+	return build(target, src, "", false)
+}
+
+// BuildFile builds a C/C++ program from file src and returns name of the resulting binary.
+func BuildFile(target *prog.Target, src string) (string, error) {
+	return build(target, nil, src, true)
+}
+
+func build(target *prog.Target, src []byte, file string, warn bool) (string, error) {
+	sysTarget := targets.Get(target.OS, target.Arch)
+	compiler := sysTarget.CCompiler
 	if _, err := exec.LookPath(compiler); err != nil {
-		return "", ErrNoCompiler
+		return "", fmt.Errorf("no target compiler %v", compiler)
 	}
+	// We call the binary syz-executor because it sometimes shows in bug titles,
+	// and we don't want 2 different bugs for when a crash is triggered during fuzzing and during repro.
+	bin, err := osutil.TempFile("syz-executor")
+	if err != nil {
+		return "", err
+	}
+
 	flags := []string{
-		"-x", lang, "-Wall", "-Werror", "-O1", "-g", "-o", bin.Name(),
-		src, "-pthread",
+		"-o", bin,
+		"-DGOOS_" + target.OS + "=1",
+		"-DGOARCH_" + target.Arch + "=1",
+		"-DHOSTGOOS_" + runtime.GOOS + "=1",
+	}
+	if file == "" {
+		flags = append(flags, "-x", "c", "-")
+	} else {
+		flags = append(flags, file)
 	}
 	flags = append(flags, sysTarget.CrossCFlags...)
 	if sysTarget.PtrSize == 4 {
 		// We do generate uint64's for syscall arguments that overflow longs on 32-bit archs.
 		flags = append(flags, "-Wno-overflow")
 	}
-	out, err := osutil.Command(compiler, append(flags, "-static")...).CombinedOutput()
-	if err != nil {
-		// Some distributions don't have static libraries.
-		out, err = osutil.Command(compiler, flags...).CombinedOutput()
+	if !warn {
+		flags = append(flags, "-fpermissive", "-w")
 	}
+	cmd := osutil.Command(compiler, flags...)
+	if file == "" {
+		cmd.Stdin = bytes.NewReader(src)
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Remove(bin.Name())
-		data, _ := ioutil.ReadFile(src)
+		os.Remove(bin)
+		if file != "" {
+			src, _ = ioutil.ReadFile(file)
+		}
 		return "", fmt.Errorf("failed to build program:\n%s\n%s\ncompiler invocation: %v %v",
-			data, out, compiler, flags)
+			src, out, compiler, flags)
 	}
-	return bin.Name(), nil
+	return bin, nil
 }
-
-var ErrNoCompiler = errors.New("no target compiler")
 
 // Format reformats C source using clang-format.
 func Format(src []byte) ([]byte, error) {

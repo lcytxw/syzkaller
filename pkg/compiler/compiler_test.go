@@ -5,15 +5,20 @@ package compiler
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/serializer"
 	"github.com/google/syzkaller/sys/targets"
 )
+
+var flagUpdate = flag.Bool("update", false, "reformat all.txt")
 
 func TestCompileAll(t *testing.T) {
 	for os, arches := range targets.List {
@@ -49,13 +54,13 @@ func TestCompileAll(t *testing.T) {
 func TestNoErrors(t *testing.T) {
 	t.Parallel()
 	consts := map[string]uint64{
-		"__NR_foo": 1,
-		"C0":       0,
-		"C1":       1,
-		"C2":       2,
+		"SYS_foo": 1,
+		"C0":      0,
+		"C1":      1,
+		"C2":      2,
 	}
 	for _, name := range []string{"all.txt"} {
-		for _, arch := range []string{"32", "64"} {
+		for _, arch := range []string{"32_shmem", "64"} {
 			name, arch := name, arch
 			t.Run(fmt.Sprintf("%v/%v", name, arch), func(t *testing.T) {
 				t.Parallel()
@@ -63,13 +68,21 @@ func TestNoErrors(t *testing.T) {
 				eh := func(pos ast.Pos, msg string) {
 					t.Logf("%v: %v", pos, msg)
 				}
-				data, err := ioutil.ReadFile(filepath.Join("testdata", name))
+				fileName := filepath.Join("testdata", name)
+				data, err := ioutil.ReadFile(fileName)
 				if err != nil {
 					t.Fatal(err)
 				}
 				astDesc := ast.Parse(data, name, eh)
 				if astDesc == nil {
 					t.Fatalf("parsing failed")
+				}
+				formatted := ast.Format(astDesc)
+				if !bytes.Equal(data, formatted) {
+					if *flagUpdate {
+						ioutil.WriteFile(fileName, formatted, 0644)
+					}
+					t.Fatalf("description is not formatted")
 				}
 				constInfo := ExtractConsts(astDesc, target, eh)
 				if constInfo == nil {
@@ -99,7 +112,7 @@ func TestNoErrors(t *testing.T) {
 
 func TestErrors(t *testing.T) {
 	t.Parallel()
-	for _, arch := range []string{"32", "64"} {
+	for _, arch := range []string{"32_shmem", "64"} {
 		target := targets.List["test"][arch]
 		t.Run(arch, func(t *testing.T) {
 			t.Parallel()
@@ -118,12 +131,12 @@ func TestErrors(t *testing.T) {
 func TestErrors2(t *testing.T) {
 	t.Parallel()
 	consts := map[string]uint64{
-		"__NR_foo": 1,
-		"C0":       0,
-		"C1":       1,
-		"C2":       2,
+		"SYS_foo": 1,
+		"C0":      0,
+		"C1":      1,
+		"C2":      2,
 	}
-	for _, arch := range []string{"32", "64"} {
+	for _, arch := range []string{"32_shmem", "64"} {
 		target := targets.List["test"][arch]
 		t.Run(arch, func(t *testing.T) {
 			t.Parallel()
@@ -144,6 +157,36 @@ func TestErrors2(t *testing.T) {
 	}
 }
 
+func TestWarnings(t *testing.T) {
+	t.Parallel()
+	consts := map[string]uint64{
+		"SYS_foo": 1,
+	}
+	for _, arch := range []string{"32_shmem", "64"} {
+		target := targets.List["test"][arch]
+		t.Run(arch, func(t *testing.T) {
+			t.Parallel()
+			em := ast.NewErrorMatcher(t, filepath.Join("testdata", "warnings.txt"))
+			desc := ast.Parse(em.Data, "warnings.txt", em.ErrorHandler)
+			if desc == nil {
+				em.DumpErrors(t)
+				t.Fatalf("parsing failed")
+			}
+			info := ExtractConsts(desc, target, em.ErrorHandler)
+			if info == nil {
+				em.DumpErrors(t)
+				t.Fatalf("const extraction failed")
+			}
+			p := Compile(desc, consts, target, em.ErrorHandler)
+			if p == nil {
+				em.DumpErrors(t)
+				t.Fatalf("compilation failed")
+			}
+			em.Check(t)
+		})
+	}
+}
+
 func TestFuzz(t *testing.T) {
 	t.Parallel()
 	inputs := []string{
@@ -151,8 +194,13 @@ func TestFuzz(t *testing.T) {
 		"da[",
 		"define\x98define(define\x98define\x98define\x98define\x98define)define\tdefin",
 		"resource g[g]",
+		`t[
+l	t
+]`,
+		`t()D[0]
+type D[e]l`,
 	}
-	consts := map[string]uint64{"A": 1, "B": 2, "C": 3, "__NR_C": 4}
+	consts := map[string]uint64{"A": 1, "B": 2, "C": 3, "SYS_A": 4, "SYS_B": 5, "SYS_C": 6}
 	eh := func(pos ast.Pos, msg string) {
 		t.Logf("%v: %v", pos, msg)
 	}
@@ -187,10 +235,97 @@ s2 {
 	if desc == nil {
 		t.Fatal("failed to parse")
 	}
-	p := Compile(desc, map[string]uint64{"__NR_foo": 1}, targets.List["test"]["64"], nil)
+	p := Compile(desc, map[string]uint64{"SYS_foo": 1}, targets.List["test"]["64"], nil)
 	if p == nil {
 		t.Fatal("failed to compile")
 	}
 	got := p.StructDescs[0].Desc
 	t.Logf("got: %#v", got)
+}
+
+func TestCollectUnusedError(t *testing.T) {
+	t.Parallel()
+	const input = `
+		s0 {
+			f0 fidl_string
+		}
+        `
+	nopErrorHandler := func(pos ast.Pos, msg string) {}
+	desc := ast.Parse([]byte(input), "input", nopErrorHandler)
+	if desc == nil {
+		t.Fatal("failed to parse")
+	}
+
+	_, err := CollectUnused(desc, targets.List["test"]["64"], nopErrorHandler)
+	if err == nil {
+		t.Fatal("CollectUnused should have failed but didn't")
+	}
+}
+
+func TestCollectUnused(t *testing.T) {
+	t.Parallel()
+	inputs := []struct {
+		text  string
+		names []string
+	}{
+		{
+			text: `
+				s0 {
+					f0 string
+				}
+			`,
+			names: []string{"s0"},
+		},
+		{
+			text: `
+				foo$0(a ptr[in, s0])
+				s0 {
+					f0	int8
+					f1	int16
+				}
+			`,
+			names: []string{},
+		},
+		{
+			text: `
+				s0 {
+					f0	int8
+					f1	int16
+				}
+				s1 {
+					f2      int32
+				}
+				foo$0(a ptr[in, s0])
+			`,
+			names: []string{"s1"},
+		},
+	}
+
+	for i, input := range inputs {
+		desc := ast.Parse([]byte(input.text), "input", nil)
+		if desc == nil {
+			t.Fatalf("Test %d: failed to parse", i)
+		}
+
+		nodes, err := CollectUnused(desc, targets.List["test"]["64"], nil)
+		if err != nil {
+			t.Fatalf("Test %d: CollectUnused failed: %v", i, err)
+		}
+
+		if len(input.names) != len(nodes) {
+			t.Errorf("Test %d: want %d nodes, got %d", i, len(input.names), len(nodes))
+		}
+
+		names := make([]string, len(nodes))
+		for i := range nodes {
+			_, _, names[i] = nodes[i].Info()
+		}
+
+		sort.Strings(names)
+		sort.Strings(input.names)
+
+		if !reflect.DeepEqual(names, input.names) {
+			t.Errorf("Test %d: Unused nodes differ. Want %v, Got %v", i, input.names, names)
+		}
+	}
 }

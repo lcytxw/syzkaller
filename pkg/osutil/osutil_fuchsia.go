@@ -14,7 +14,8 @@ import (
 func HandleInterrupts(shutdown chan struct{}) {
 }
 
-func UmountAll(dir string) {
+func RemoveAll(dir string) error {
+	return os.RemoveAll(dir)
 }
 
 func CreateMemMappedFile(size int) (f *os.File, mem []byte, err error) {
@@ -30,10 +31,6 @@ func ProcessExitStatus(ps *os.ProcessState) int {
 	return 0
 }
 
-func ProcessSignal(p *os.Process, sig int) bool {
-	return false
-}
-
 func prolongPipe(r, w *os.File) {
 }
 
@@ -46,4 +43,7 @@ func SandboxChown(file string) error {
 }
 
 func setPdeathsig(cmd *exec.Cmd) {
+}
+
+func killPgroup(cmd *exec.Cmd) {
 }

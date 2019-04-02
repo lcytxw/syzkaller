@@ -43,13 +43,12 @@ type Prog struct {
 	fileConsts map[string]*ConstInfo
 }
 
-// Compile compiles sys description.
-func Compile(desc *ast.Description, consts map[string]uint64, target *targets.Target, eh ast.ErrorHandler) *Prog {
+func createCompiler(desc *ast.Description, target *targets.Target, eh ast.ErrorHandler) *compiler {
 	if eh == nil {
 		eh = ast.LoggingHandler
 	}
 	comp := &compiler{
-		desc:         desc.Clone(),
+		desc:         desc,
 		target:       target,
 		eh:           eh,
 		ptrSize:      target.PtrSize,
@@ -60,13 +59,24 @@ func Compile(desc *ast.Description, consts map[string]uint64, target *targets.Ta
 		intFlags:     make(map[string]*ast.IntFlags),
 		strFlags:     make(map[string]*ast.StrFlags),
 		used:         make(map[string]bool),
+		usedTypedefs: make(map[string]bool),
 		structDescs:  make(map[prog.StructKey]*prog.StructDesc),
 		structNodes:  make(map[*prog.StructDesc]*ast.Struct),
 		structVarlen: make(map[string]bool),
 	}
-	for name, typedef := range builtinTypedefs {
-		comp.typedefs[name] = typedef
+	for name, n := range builtinTypedefs {
+		comp.typedefs[name] = n
+		comp.usedTypedefs[name] = true
 	}
+	for name, n := range builtinStrFlags {
+		comp.strFlags[name] = n
+	}
+	return comp
+}
+
+// Compile compiles sys description.
+func Compile(desc *ast.Description, consts map[string]uint64, target *targets.Target, eh ast.ErrorHandler) *Prog {
+	comp := createCompiler(desc.Clone(), target, eh)
 	comp.typecheck()
 	// The subsequent, more complex, checks expect basic validity of the tree,
 	// in particular corrent number of type arguments. If there were errors,
@@ -113,13 +123,14 @@ type compiler struct {
 	warnings []warn
 	ptrSize  uint64
 
-	unsupported map[string]bool
-	resources   map[string]*ast.Resource
-	typedefs    map[string]*ast.TypeDef
-	structs     map[string]*ast.Struct
-	intFlags    map[string]*ast.IntFlags
-	strFlags    map[string]*ast.StrFlags
-	used        map[string]bool // contains used structs/resources
+	unsupported  map[string]bool
+	resources    map[string]*ast.Resource
+	typedefs     map[string]*ast.TypeDef
+	structs      map[string]*ast.Struct
+	intFlags     map[string]*ast.IntFlags
+	strFlags     map[string]*ast.StrFlags
+	used         map[string]bool // contains used structs/resources
+	usedTypedefs map[string]bool
 
 	structDescs  map[prog.StructKey]*prog.StructDesc
 	structNodes  map[*prog.StructDesc]*ast.Struct
@@ -173,7 +184,7 @@ func (comp *compiler) parseUnionAttrs(n *ast.Struct) (varlen bool, size uint64) 
 			}
 			varlen = true
 		case "size":
-			size = comp.parseSizeAttr(n, attr)
+			size = comp.parseSizeAttr(attr)
 		default:
 			comp.error(attr.Pos, "unknown union %v attribute %v",
 				n.Name.Name, attr.Ident)
@@ -212,7 +223,7 @@ func (comp *compiler) parseStructAttrs(n *ast.Struct) (packed bool, size, align 
 			}
 			align = a
 		case attr.Ident == "size":
-			size = comp.parseSizeAttr(n, attr)
+			size = comp.parseSizeAttr(attr)
 		default:
 			comp.error(attr.Pos, "unknown struct %v attribute %v",
 				n.Name.Name, attr.Ident)
@@ -221,7 +232,7 @@ func (comp *compiler) parseStructAttrs(n *ast.Struct) (packed bool, size, align 
 	return
 }
 
-func (comp *compiler) parseSizeAttr(n *ast.Struct, attr *ast.Type) uint64 {
+func (comp *compiler) parseSizeAttr(attr *ast.Type) uint64 {
 	if len(attr.Args) != 1 {
 		comp.error(attr.Pos, "%v attribute is expected to have 1 argument", attr.Ident)
 		return sizeUnassigned
@@ -305,7 +316,7 @@ func (comp *compiler) foreachSubType(t *ast.Type, isArg bool,
 	cb(t, desc, args, base)
 	for i, arg := range args {
 		if desc.Args[i].Type == typeArgType {
-			comp.foreachSubType(arg, false, cb)
+			comp.foreachSubType(arg, desc.Args[i].IsArg, cb)
 		}
 	}
 }

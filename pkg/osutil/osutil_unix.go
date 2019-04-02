@@ -1,7 +1,7 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-// +build freebsd,!appengine netbsd,!appengine linux,!appengine darwin,!appengine
+// +build freebsd,!appengine netbsd,!appengine openbsd,!appengine linux,!appengine darwin,!appengine
 
 package osutil
 
@@ -143,15 +143,4 @@ func CloseMemMappedFile(f *os.File, mem []byte) error {
 // This is here only because of fuchsia that does not implement WaitStatus.
 func ProcessExitStatus(ps *os.ProcessState) int {
 	return ps.Sys().(syscall.WaitStatus).ExitStatus()
-}
-
-// ProcessSignal sends signal sig to the process, returns true if the process was killed.
-// Again, this is here only because of fuchsia.
-func ProcessSignal(p *os.Process, sig int) bool {
-	SIGKILL := int(syscall.SIGKILL)
-	if sig <= 0 || sig >= 32 {
-		sig = SIGKILL
-	}
-	p.Signal(syscall.Signal(sig))
-	return sig == SIGKILL
 }

@@ -7,6 +7,13 @@ import (
 	"fmt"
 )
 
+// We need to support structs as resources,
+// but for now we just special-case timespec/timeval.
+var timespecRes = &ResourceDesc{
+	Name: "timespec",
+	Kind: []string{"timespec"},
+}
+
 func (target *Target) calcResourceCtors(kind []string, precise bool) []*Syscall {
 	// Find calls that produce the necessary resources.
 	var metas []*Syscall
@@ -28,12 +35,22 @@ func (target *Target) calcResourceCtors(kind []string, precise bool) []*Syscall 
 			metas = append(metas, meta)
 		}
 	}
+	if kind[0] == timespecRes.Name {
+		if c := target.SyscallMap["clock_gettime"]; c != nil {
+			metas = append(metas, c)
+		}
+	}
 	return metas
 }
 
 // isCompatibleResource returns true if resource of kind src can be passed as an argument of kind dst.
 func (target *Target) isCompatibleResource(dst, src string) bool {
-	if dst == target.any.res32.TypeName || dst == target.any.res64.TypeName {
+	if dst == target.any.res16.TypeName ||
+		dst == target.any.res32.TypeName ||
+		dst == target.any.res64.TypeName ||
+		dst == target.any.resdec.TypeName ||
+		dst == target.any.reshex.TypeName ||
+		dst == target.any.resoct.TypeName {
 		return true
 	}
 	dstRes := target.resourceMap[dst]
@@ -70,70 +87,104 @@ func isCompatibleResourceImpl(dst, src []string, precise bool) bool {
 	return true
 }
 
-func (c *Syscall) inputResources() []*ResourceType {
-	var resources []*ResourceType
+func (target *Target) inputResources(c *Syscall) []*ResourceDesc {
+	var resources []*ResourceDesc
 	ForeachType(c, func(typ Type) {
+		if typ.Dir() == DirOut {
+			return
+		}
 		switch typ1 := typ.(type) {
 		case *ResourceType:
-			if typ1.Dir() != DirOut && !typ1.IsOptional {
-				resources = append(resources, typ1)
+			if !typ1.IsOptional {
+				resources = append(resources, typ1.Desc)
+			}
+		case *StructType:
+			if target.OS == "linux" && (typ1.Name() == "timespec" || typ1.Name() == "timeval") {
+				resources = append(resources, timespecRes)
 			}
 		}
 	})
 	return resources
 }
 
-func (target *Target) TransitivelyEnabledCalls(enabled map[*Syscall]bool) map[*Syscall]bool {
-	supported := make(map[*Syscall]bool)
-	for c := range enabled {
-		supported[c] = true
-	}
-	inputResources := make(map[*Syscall][]*ResourceType)
-	ctors := make(map[string][]*Syscall)
-	for c := range supported {
-		inputs := c.inputResources()
-		inputResources[c] = inputs
-		for _, res := range inputs {
-			if _, ok := ctors[res.Desc.Name]; ok {
-				continue
+func (target *Target) outputResources(c *Syscall) []*ResourceDesc {
+	var resources []*ResourceDesc
+	ForeachType(c, func(typ Type) {
+		switch typ1 := typ.(type) {
+		case *ResourceType:
+			if typ1.Dir() != DirIn {
+				resources = append(resources, typ1.Desc)
 			}
-			ctors[res.Desc.Name] = target.calcResourceCtors(res.Desc.Kind, true)
+		}
+	})
+	if c.CallName == "clock_gettime" {
+		resources = append(resources, timespecRes)
+	}
+	return resources
+}
+
+func (target *Target) TransitivelyEnabledCalls(enabled map[*Syscall]bool) (map[*Syscall]bool, map[*Syscall]string) {
+	supported := make(map[*Syscall]bool)
+	disabled := make(map[*Syscall]string)
+	canCreate := make(map[string]bool)
+	inputResources := make(map[*Syscall][]*ResourceDesc)
+	for c := range enabled {
+		inputResources[c] = target.inputResources(c)
+
+		if c.Name == "pipe$9p" {
+			fmt.Printf("%v: input resource: %+v\n", c.Name, inputResources[c])
 		}
 	}
 	for {
 		n := len(supported)
-		haveGettime := supported[target.SyscallMap["clock_gettime"]]
-		for c := range supported {
-			canCreate := true
+		for c := range enabled {
+			if supported[c] {
+				continue
+			}
+			ready := true
 			for _, res := range inputResources[c] {
-				noctors := true
-				for _, ctor := range ctors[res.Desc.Name] {
-					if supported[ctor] {
-						noctors = false
-						break
-					}
-				}
-				if noctors {
-					canCreate = false
+				if !canCreate[res.Name] {
+					ready = false
 					break
 				}
 			}
-			// We need to support structs as resources,
-			// but for now we just special-case timespec/timeval.
-			if canCreate && !haveGettime {
-				ForeachType(c, func(typ Type) {
-					if a, ok := typ.(*StructType); ok && a.Dir() != DirOut && (a.Name() == "timespec" || a.Name() == "timeval") {
-						canCreate = false
+			if ready {
+				supported[c] = true
+				for _, res := range target.outputResources(c) {
+					for _, kind := range res.Kind {
+						canCreate[kind] = true
 					}
-				})
-			}
-			if !canCreate {
-				delete(supported, c)
+				}
 			}
 		}
 		if n == len(supported) {
 			break
 		}
 	}
-	return supported
+	ctors := make(map[string][]string)
+	for c := range enabled {
+		if supported[c] {
+			continue
+		}
+		for _, res := range inputResources[c] {
+			if canCreate[res.Name] {
+				continue
+			}
+			if ctors[res.Name] == nil {
+				var names []string
+				for _, call := range target.calcResourceCtors(res.Kind, true) {
+					names = append(names, call.Name)
+				}
+				ctors[res.Name] = names
+			}
+			disabled[c] = fmt.Sprintf("no syscalls can create resource %v,"+
+				" enable some syscalls that can create it %v",
+				res.Name, ctors[res.Name])
+			break
+		}
+	}
+	if len(enabled) != len(supported)+len(disabled) {
+		panic("lost syscalls")
+	}
+	return supported, disabled
 }

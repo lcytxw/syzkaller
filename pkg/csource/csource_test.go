@@ -7,50 +7,25 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"runtime"
 	"testing"
 	"time"
 
-	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
+	"github.com/google/syzkaller/sys/targets"
 )
 
-func initTest(t *testing.T) (*prog.Target, rand.Source, int) {
+func TestGenerate(t *testing.T) {
 	t.Parallel()
-	iters := 1
-	seed := int64(time.Now().UnixNano())
-	rs := rand.NewSource(seed)
-	t.Logf("seed=%v", seed)
-	target, err := prog.GetTarget("linux", runtime.GOARCH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return target, rs, iters
-}
-
-func TestGenerateOne(t *testing.T) {
-	t.Parallel()
-	opts := Options{
-		Threaded:  true,
-		Collide:   true,
-		Repeat:    true,
-		Procs:     2,
-		Sandbox:   "namespace",
-		Repro:     true,
-		UseTmpDir: true,
-	}
+	checked := make(map[string]bool)
 	for _, target := range prog.AllTargets() {
-		if target.OS == "test" {
+		target := target
+		sysTarget := targets.Get(target.OS, target.Arch)
+		if runtime.GOOS != sysTarget.BuildOS {
 			continue
 		}
-		if target.OS == "fuchsia" {
-			continue // TODO(dvyukov): support fuchsia
-		}
-		if target.OS == "windows" {
-			continue // TODO(dvyukov): support windows
-		}
-		target := target
 		t.Run(target.OS+"/"+target.Arch, func(t *testing.T) {
 			if target.OS == "linux" && target.Arch == "arm" {
 				// This currently fails (at least with my arm-linux-gnueabihf-gcc-4.8) with:
@@ -63,40 +38,69 @@ func TestGenerateOne(t *testing.T) {
 				// fatal error: asm/unistd.h: No such file or directory
 				t.Skip("broken")
 			}
-			t.Parallel()
-			rs := rand.NewSource(0)
-			p := target.GenerateAllSyzProg(rs)
-			if len(p.Calls) == 0 {
-				t.Skip("no syz syscalls")
+			if target.OS == "linux" && target.Arch == "arm64" {
+				// Episodically fails on travis with:
+				// collect2: error: ld terminated with signal 11 [Segmentation fault]
+				t.Skip("broken")
 			}
-			testOne(t, p, opts)
+			if target.OS == "test" && target.PtrSize == 4 {
+				// The same reason as linux/32.
+				t.Skip("broken")
+			}
+			if _, err := exec.LookPath(sysTarget.CCompiler); err != nil {
+				t.Skipf("no target compiler %v", sysTarget.CCompiler)
+			}
+			full := !checked[target.OS]
+			checked[target.OS] = true
+			t.Parallel()
+			testTarget(t, target, full)
 		})
+
 	}
 }
 
-func TestGenerateOptions(t *testing.T) {
-	target, rs, _ := initTest(t)
-	syzProg := target.GenerateAllSyzProg(rs)
-	t.Logf("syz program:\n%s\n", syzProg.Serialize())
-	permutations := allOptionsSingle()
-	allPermutations := allOptionsPermutations()
-	if testing.Short() {
-		r := rand.New(rs)
-		for i := 0; i < 32; i++ {
-			permutations = append(permutations, allPermutations[r.Intn(len(allPermutations))])
-		}
-	} else {
-		permutations = allPermutations
+func testTarget(t *testing.T, target *prog.Target, full bool) {
+	seed := time.Now().UnixNano()
+	if os.Getenv("TRAVIS") != "" {
+		seed = 0 // required for deterministic coverage reports
 	}
-	for i, opts := range permutations {
-		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
-			target, rs, iters := initTest(t)
-			t.Logf("opts: %+v", opts)
-			for i := 0; i < iters; i++ {
-				p := target.Generate(rs, 10, nil)
-				testOne(t, p, opts)
-			}
-			testOne(t, syzProg, opts)
+	rs := rand.NewSource(seed)
+	t.Logf("seed=%v", seed)
+	p := target.Generate(rs, 10, nil)
+	// Turns out that fully minimized program can trigger new interesting warnings,
+	// e.g. about NULL arguments for functions that require non-NULL arguments in syz_ functions.
+	// We could append both AllSyzProg as-is and a minimized version of it,
+	// but this makes the NULL argument warnings go away (they showed up in ".constprop" versions).
+	// Testing 2 programs takes too long since we have lots of options permutations and OS/arch.
+	// So we use the as-is in short tests and minimized version in full tests.
+	syzProg := target.GenerateAllSyzProg(rs)
+	var opts []Options
+	if !full || testing.Short() {
+		p.Calls = append(p.Calls, syzProg.Calls...)
+		opts = allOptionsSingle(target.OS)
+		// This is the main configuration used by executor,
+		// so we want to test it as well.
+		opts = append(opts, Options{
+			Threaded:  true,
+			Collide:   true,
+			Repeat:    true,
+			Procs:     2,
+			Sandbox:   "none",
+			Repro:     true,
+			UseTmpDir: true,
+		})
+	} else {
+		minimized, _ := prog.Minimize(syzProg, -1, false, func(p *prog.Prog, call int) bool {
+			return len(p.Calls) == len(syzProg.Calls)
+		})
+		p.Calls = append(p.Calls, minimized.Calls...)
+		opts = allOptionsPermutations(target.OS)
+	}
+	for opti, opts := range opts {
+		opts := opts
+		t.Run(fmt.Sprintf("%v", opti), func(t *testing.T) {
+			t.Parallel()
+			testOne(t, p, opts)
 		})
 	}
 }
@@ -104,21 +108,12 @@ func TestGenerateOptions(t *testing.T) {
 func testOne(t *testing.T, p *prog.Prog, opts Options) {
 	src, err := Write(p, opts)
 	if err != nil {
-		t.Logf("program:\n%s\n", p.Serialize())
+		t.Logf("opts: %+v\nprogram:\n%s\n", opts, p.Serialize())
 		t.Fatalf("%v", err)
 	}
-	srcf, err := osutil.WriteTempFile(src)
+	bin, err := Build(p.Target, src)
 	if err != nil {
-		t.Logf("program:\n%s\n", p.Serialize())
-		t.Fatalf("%v", err)
-	}
-	defer os.Remove(srcf)
-	bin, err := Build(p.Target, "c", srcf)
-	if err == ErrNoCompiler {
-		t.Skip(err)
-	}
-	if err != nil {
-		t.Logf("program:\n%s\n", p.Serialize())
+		t.Logf("opts: %+v\nprogram:\n%s\n", opts, p.Serialize())
 		t.Fatalf("%v", err)
 	}
 	defer os.Remove(bin)

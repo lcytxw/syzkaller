@@ -1,16 +1,14 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-//go:generate bash -c "echo -e 'package ifuzz\nvar Insns []*Insn' > insns.go"
-//go:generate bash -c "go run gen/gen.go gen/all-enc-instructions.txt > /tmp/insns.go"
-//go:generate mv /tmp/insns.go insns.go
-//go:generate go fmt insns.go
+//go:generate bash -c "go run gen/gen.go gen/all-enc-instructions.txt > generated/insns.go"
 
 // Package ifuzz allows to generate and mutate x86 machine code.
 package ifuzz
 
 import (
 	"math/rand"
+	"sync"
 )
 
 const (
@@ -79,7 +77,15 @@ const (
 
 var modeInsns [ModeLast][typeLast][]*Insn
 
-func init() {
+var (
+	Insns    []*Insn
+	initOnce sync.Once
+)
+
+func initInsns() {
+	if len(Insns) == 0 {
+		panic("no instructions")
+	}
 	initPseudo()
 	for mode := 0; mode < ModeLast; mode++ {
 		for _, insn := range Insns {
@@ -101,6 +107,7 @@ func init() {
 
 // ModeInsns returns list of all instructions for the given mode.
 func ModeInsns(cfg *Config) []*Insn {
+	initOnce.Do(initInsns)
 	if cfg.Mode < 0 || cfg.Mode >= ModeLast {
 		panic("bad mode")
 	}
@@ -116,6 +123,7 @@ func ModeInsns(cfg *Config) []*Insn {
 }
 
 func Generate(cfg *Config, r *rand.Rand) []byte {
+	initOnce.Do(initInsns)
 	var text []byte
 	for i := 0; i < cfg.Len; i++ {
 		insn := randInsn(cfg, r)
@@ -125,6 +133,7 @@ func Generate(cfg *Config, r *rand.Rand) []byte {
 }
 
 func Mutate(cfg *Config, r *rand.Rand, text []byte) []byte {
+	initOnce.Do(initInsns)
 	insns := split(cfg, text)
 	retry := false
 	for stop := false; !stop || retry || len(insns) == 0; stop = r.Intn(2) == 0 {
@@ -149,23 +158,23 @@ func Mutate(cfg *Config, r *rand.Rand, text []byte) []byte {
 				switch x := r.Intn(100); {
 				case x < 5 && len(text1) != 0:
 					// delete byte
-					i := r.Intn(len(text1))
-					copy(text1[i:], text1[i+1:])
+					pos := r.Intn(len(text1))
+					copy(text1[pos:], text1[pos+1:])
 					text1 = text1[:len(text1)-1]
 				case x < 40 && len(text1) != 0:
 					// replace a byte
-					i := r.Intn(len(text1))
-					text1[i] = byte(r.Intn(256))
+					pos := r.Intn(len(text1))
+					text1[pos] = byte(r.Intn(256))
 				case x < 70 && len(text1) != 0:
 					// flip a bit
-					i := r.Intn(len(text1))
-					text1[i] ^= 1 << byte(r.Intn(8))
+					pos := r.Intn(len(text1))
+					text1[pos] ^= 1 << byte(r.Intn(8))
 				default:
 					// insert a byte
-					i := r.Intn(len(text1) + 1)
+					pos := r.Intn(len(text1) + 1)
 					text1 = append(text1, 0)
-					copy(text1[i+1:], text1[i:])
-					text1[i] = byte(r.Intn(256))
+					copy(text1[pos+1:], text1[pos:])
+					text1[pos] = byte(r.Intn(256))
 				}
 			}
 			insns[i] = text1

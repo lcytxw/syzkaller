@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/syzkaller/pkg/compiler"
 )
@@ -25,10 +26,20 @@ func (*akaros) prepareArch(arch *Arch) error {
 
 func (*akaros) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error) {
 	dir := arch.sourceDir
-	syscallH := filepath.Join(dir, "kern", "include", "ros", "bits", "syscall.h")
-	args := []string{"-fmessage-length=0", "--include", syscallH}
+	args := []string{
+		"-fmessage-length=0",
+		"-D__KERNEL__",
+		"-DROS_KERNEL",
+		"-I", filepath.Join(dir, "kern", "include"),
+		"-I", filepath.Join(dir, "user", "parlib", "include"),
+	}
 	for _, incdir := range info.Incdirs {
 		args = append(args, "-I"+filepath.Join(dir, incdir))
+	}
+	if arch.includeDirs != "" {
+		for _, dir := range strings.Split(arch.includeDirs, ",") {
+			args = append(args, "-I"+dir)
+		}
 	}
 	return extract(info, "gcc", args, "", true)
 }

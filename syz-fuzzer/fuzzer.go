@@ -5,28 +5,25 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/ipc/ipcconfig"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
-	. "github.com/google/syzkaller/pkg/rpctype"
+	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/sys"
+	_ "github.com/google/syzkaller/sys"
 )
 
 type Fuzzer struct {
@@ -40,14 +37,11 @@ type Fuzzer struct {
 	needPoll    chan struct{}
 	choiceTable *prog.ChoiceTable
 	stats       [StatCount]uint64
-	manager     *RPCClient
+	manager     *rpctype.RPCClient
 	target      *prog.Target
 
 	faultInjectionEnabled    bool
 	comparisonTracingEnabled bool
-	coverageEnabled          bool
-	leakCheckEnabled         bool
-	leakCheckReady           uint32
 
 	corpusMu     sync.RWMutex
 	corpus       []*prog.Prog
@@ -99,141 +93,120 @@ func main() {
 	debug.SetGCPercent(50)
 
 	var (
-		flagName    = flag.String("name", "", "unique name for manager")
+		flagName    = flag.String("name", "test", "unique name for manager")
+		flagOS      = flag.String("os", runtime.GOOS, "target OS")
 		flagArch    = flag.String("arch", runtime.GOARCH, "target arch")
 		flagManager = flag.String("manager", "", "manager rpc address")
 		flagProcs   = flag.Int("procs", 1, "number of parallel test processes")
-		flagLeak    = flag.Bool("leak", false, "detect memory leaks")
 		flagOutput  = flag.String("output", "stdout", "write programs to none/stdout/dmesg/file")
 		flagPprof   = flag.String("pprof", "", "address to serve pprof profiles")
-		flagTest    = flag.Bool("test", false, "enable image testing mode") // used by syz-ci
+		flagTest    = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
+		flagRunTest = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
 	)
 	flag.Parse()
-	var outputType OutputType
-	switch *flagOutput {
-	case "none":
-		outputType = OutputNone
-	case "stdout":
-		outputType = OutputStdout
-	case "dmesg":
-		outputType = OutputDmesg
-	case "file":
-		outputType = OutputFile
-	default:
-		fmt.Fprintf(os.Stderr, "-output flag must be one of none/stdout/dmesg/file\n")
-		os.Exit(1)
-	}
-	Logf(0, "fuzzer started")
+	outputType := parseOutputType(*flagOutput)
+	log.Logf(0, "fuzzer started")
 
-	target, err := prog.GetTarget(runtime.GOOS, *flagArch)
+	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
-		Fatalf("%v", err)
+		log.Fatalf("%v", err)
 	}
 
-	config, execOpts, err := ipc.DefaultConfig()
+	config, execOpts, err := ipcconfig.Default(target)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to create default ipc config: %v", err)
 	}
-	sandbox := "none"
-	if config.Flags&ipc.FlagSandboxSetuid != 0 {
-		sandbox = "setuid"
-	} else if config.Flags&ipc.FlagSandboxNamespace != 0 {
-		sandbox = "namespace"
-	}
-
+	sandbox := ipc.FlagsToSandbox(config.Flags)
 	shutdown := make(chan struct{})
 	osutil.HandleInterrupts(shutdown)
 	go func() {
 		// Handles graceful preemption on GCE.
 		<-shutdown
-		Logf(0, "SYZ-FUZZER: PREEMPTED")
+		log.Logf(0, "SYZ-FUZZER: PREEMPTED")
 		os.Exit(1)
 	}()
 
+	checkArgs := &checkArgs{
+		target:      target,
+		sandbox:     sandbox,
+		ipcConfig:   config,
+		ipcExecOpts: execOpts,
+	}
 	if *flagTest {
-		testImage(*flagManager, target, sandbox)
+		testImage(*flagManager, checkArgs)
 		return
 	}
 
 	if *flagPprof != "" {
 		go func() {
 			err := http.ListenAndServe(*flagPprof, nil)
-			Fatalf("failed to serve pprof profiles: %v", err)
+			log.Fatalf("failed to serve pprof profiles: %v", err)
 		}()
 	} else {
 		runtime.MemProfileRate = 0
 	}
 
-	Logf(0, "dialing manager at %v", *flagManager)
-	a := &ConnectArgs{*flagName}
-	r := &ConnectRes{}
-	if err := RPCCall(*flagManager, "Manager.Connect", a, r); err != nil {
-		panic(err)
+	log.Logf(0, "dialing manager at %v", *flagManager)
+	manager, err := rpctype.NewRPCClient(*flagManager)
+	if err != nil {
+		log.Fatalf("failed to connect to manager: %v ", err)
 	}
-	calls := buildCallList(target, r.EnabledCalls, sandbox)
-	ct := target.BuildChoiceTable(r.Prios, calls)
-
-	// This requires "fault-inject: support systematic fault injection" kernel commit.
-	faultInjectionEnabled := false
-	if fd, err := syscall.Open("/proc/self/fail-nth", syscall.O_RDWR, 0); err == nil {
-		syscall.Close(fd)
-		faultInjectionEnabled = true
+	a := &rpctype.ConnectArgs{Name: *flagName}
+	r := &rpctype.ConnectRes{}
+	if err := manager.Call("Manager.Connect", a, r); err != nil {
+		log.Fatalf("failed to connect to manager: %v ", err)
 	}
-
-	if calls[target.SyscallMap["syz_emit_ethernet"]] ||
-		calls[target.SyscallMap["syz_extract_tcp_res"]] {
-		config.Flags |= ipc.FlagEnableTun
+	if r.CheckResult == nil {
+		checkArgs.gitRevision = r.GitRevision
+		checkArgs.targetRevision = r.TargetRevision
+		checkArgs.enabledCalls = r.EnabledCalls
+		checkArgs.allSandboxes = r.AllSandboxes
+		r.CheckResult, err = checkMachine(checkArgs)
+		if err != nil {
+			r.CheckResult = &rpctype.CheckArgs{
+				Error: err.Error(),
+			}
+		}
+		r.CheckResult.Name = *flagName
+		if err := manager.Call("Manager.Check", r.CheckResult, nil); err != nil {
+			log.Fatalf("Manager.Check call failed: %v", err)
+		}
+		if r.CheckResult.Error != "" {
+			log.Fatalf("%v", r.CheckResult.Error)
+		}
 	}
-	if faultInjectionEnabled {
+	log.Logf(0, "syscalls: %v", len(r.CheckResult.EnabledCalls[sandbox]))
+	for _, feat := range r.CheckResult.Features {
+		log.Logf(0, "%v: %v", feat.Name, feat.Reason)
+	}
+	periodicCallback, err := host.Setup(target, r.CheckResult.Features)
+	if err != nil {
+		log.Fatalf("BUG: %v", err)
+	}
+	var gateCallback func()
+	if periodicCallback != nil {
+		gateCallback = func() { periodicCallback(r.MemoryLeakFrames) }
+	}
+	if r.CheckResult.Features[host.FeatureExtraCoverage].Enabled {
+		config.Flags |= ipc.FlagExtraCover
+	}
+	if r.CheckResult.Features[host.FeatureFaultInjection].Enabled {
 		config.Flags |= ipc.FlagEnableFault
 	}
-	coverageEnabled := config.Flags&ipc.FlagSignal != 0
-
-	kcov, comparisonTracingEnabled := checkCompsSupported()
-	Logf(0, "kcov=%v, comps=%v", kcov, comparisonTracingEnabled)
-	if r.NeedCheck {
-		out, err := osutil.RunCmd(time.Minute, "", config.Executor, "version")
-		if err != nil {
-			panic(err)
-		}
-		vers := strings.Split(strings.TrimSpace(string(out)), " ")
-		if len(vers) != 4 {
-			panic(fmt.Sprintf("bad executor version: %q", string(out)))
-		}
-		a := &CheckArgs{
-			Name:           *flagName,
-			UserNamespaces: osutil.IsExist("/proc/self/ns/user"),
-			FuzzerGitRev:   sys.GitRevision,
-			FuzzerSyzRev:   target.Revision,
-			ExecutorGitRev: vers[3],
-			ExecutorSyzRev: vers[2],
-			ExecutorArch:   vers[1],
-		}
-		a.Kcov = kcov
-		if fd, err := syscall.Open("/sys/kernel/debug/kmemleak", syscall.O_RDWR, 0); err == nil {
-			syscall.Close(fd)
-			a.Leak = true
-		}
-		a.Fault = faultInjectionEnabled
-		a.CompsSupported = comparisonTracingEnabled
-		for c := range calls {
-			a.Calls = append(a.Calls, c.Name)
-		}
-		if err := RPCCall(*flagManager, "Manager.Check", a, nil); err != nil {
-			panic(err)
-		}
+	if r.CheckResult.Features[host.FeatureNetworkInjection].Enabled {
+		config.Flags |= ipc.FlagEnableTun
 	}
-
-	// Manager.Connect reply can ve very large and that memory will be permanently cached in the connection.
-	// So we do the call on a transient connection, free all memory and reconnect.
-	// The rest of rpc requests have bounded size.
-	debug.FreeOSMemory()
-	manager, err := NewRPCClient(*flagManager)
-	if err != nil {
-		panic(err)
+	if r.CheckResult.Features[host.FeatureNetworkDevices].Enabled {
+		config.Flags |= ipc.FlagEnableNetDev
 	}
+	config.Flags |= ipc.FlagEnableNetReset
+	config.Flags |= ipc.FlagEnableCgroups
+	config.Flags |= ipc.FlagEnableBinfmtMisc
 
-	kmemleakInit(*flagLeak)
+	if *flagRunTest {
+		runTest(target, manager, *flagName, config.Executor)
+		return
+	}
 
 	needPoll := make(chan struct{}, 1)
 	needPoll <- struct{}{}
@@ -242,49 +215,28 @@ func main() {
 		outputType:               outputType,
 		config:                   config,
 		execOpts:                 execOpts,
+		gate:                     ipc.NewGate(2**flagProcs, gateCallback),
 		workQueue:                newWorkQueue(*flagProcs, needPoll),
 		needPoll:                 needPoll,
-		choiceTable:              ct,
 		manager:                  manager,
 		target:                   target,
-		faultInjectionEnabled:    faultInjectionEnabled,
-		comparisonTracingEnabled: comparisonTracingEnabled,
-		coverageEnabled:          coverageEnabled,
-		leakCheckEnabled:         *flagLeak,
+		faultInjectionEnabled:    r.CheckResult.Features[host.FeatureFaultInjection].Enabled,
+		comparisonTracingEnabled: r.CheckResult.Features[host.FeatureComparisons].Enabled,
 		corpusHashes:             make(map[hash.Sig]struct{}),
 	}
-	fuzzer.gate = ipc.NewGate(2**flagProcs, fuzzer.leakCheckCallback)
-
-	for _, inp := range r.Inputs {
-		fuzzer.addInputFromAnotherFuzzer(inp)
+	for i := 0; fuzzer.poll(i == 0, nil); i++ {
 	}
-	fuzzer.addMaxSignal(r.MaxSignal.Deserialize())
-	for _, candidate := range r.Candidates {
-		p, err := fuzzer.target.Deserialize(candidate.Prog)
-		if err != nil {
-			panic(err)
-		}
-		if coverageEnabled {
-			flags := ProgCandidate
-			if candidate.Minimized {
-				flags |= ProgMinimized
-			}
-			if candidate.Smashed {
-				flags |= ProgSmashed
-			}
-			fuzzer.workQueue.enqueue(&WorkCandidate{
-				p:     p,
-				flags: flags,
-			})
-		} else {
-			fuzzer.addInputToCorpus(p, nil, hash.Hash(candidate.Prog))
-		}
+	calls := make(map[*prog.Syscall]bool)
+	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
+		calls[target.Syscalls[id]] = true
 	}
+	prios := target.CalculatePriorities(fuzzer.corpus)
+	fuzzer.choiceTable = target.BuildChoiceTable(prios, calls)
 
 	for pid := 0; pid < *flagProcs; pid++ {
 		proc, err := newProc(fuzzer, pid)
 		if err != nil {
-			Fatalf("failed to create proc: %v", err)
+			log.Fatalf("failed to create proc: %v", err)
 		}
 		fuzzer.procs = append(fuzzer.procs, proc)
 		go proc.loop()
@@ -307,7 +259,7 @@ func (fuzzer *Fuzzer) pollLoop() {
 		}
 		if fuzzer.outputType != OutputStdout && time.Since(lastPrint) > 10*time.Second {
 			// Keep-alive for manager.
-			Logf(0, "alive, executed %v", execTotal)
+			log.Logf(0, "alive, executed %v", execTotal)
 			lastPrint = time.Now()
 		}
 		if poll || time.Since(lastPoll) > 10*time.Second {
@@ -315,122 +267,75 @@ func (fuzzer *Fuzzer) pollLoop() {
 			if poll && !needCandidates {
 				continue
 			}
-
-			a := &PollArgs{
-				Name:           fuzzer.name,
-				NeedCandidates: needCandidates,
-				Stats:          make(map[string]uint64),
-			}
-			a.MaxSignal = fuzzer.grabNewSignal().Serialize()
+			stats := make(map[string]uint64)
 			for _, proc := range fuzzer.procs {
-				a.Stats["exec total"] += atomic.SwapUint64(&proc.env.StatExecs, 0)
-				a.Stats["executor restarts"] += atomic.SwapUint64(&proc.env.StatRestarts, 0)
+				stats["exec total"] += atomic.SwapUint64(&proc.env.StatExecs, 0)
+				stats["executor restarts"] += atomic.SwapUint64(&proc.env.StatRestarts, 0)
 			}
-
 			for stat := Stat(0); stat < StatCount; stat++ {
 				v := atomic.SwapUint64(&fuzzer.stats[stat], 0)
-				a.Stats[statNames[stat]] = v
+				stats[statNames[stat]] = v
 				execTotal += v
 			}
-
-			r := &PollRes{}
-			if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
-				panic(err)
-			}
-			maxSignal := r.MaxSignal.Deserialize()
-			Logf(1, "poll: candidates=%v inputs=%v signal=%v",
-				len(r.Candidates), len(r.NewInputs), maxSignal.Len())
-			fuzzer.addMaxSignal(maxSignal)
-			for _, inp := range r.NewInputs {
-				fuzzer.addInputFromAnotherFuzzer(inp)
-			}
-			for _, candidate := range r.Candidates {
-				p, err := fuzzer.target.Deserialize(candidate.Prog)
-				if err != nil {
-					panic(err)
-				}
-				if fuzzer.coverageEnabled {
-					flags := ProgCandidate
-					if candidate.Minimized {
-						flags |= ProgMinimized
-					}
-					if candidate.Smashed {
-						flags |= ProgSmashed
-					}
-					fuzzer.workQueue.enqueue(&WorkCandidate{
-						p:     p,
-						flags: flags,
-					})
-				} else {
-					fuzzer.addInputToCorpus(p, nil, hash.Hash(candidate.Prog))
-				}
-			}
-			if len(r.Candidates) == 0 && fuzzer.leakCheckEnabled &&
-				atomic.LoadUint32(&fuzzer.leakCheckReady) == 0 {
-				kmemleakScan(false) // ignore boot leaks
-				atomic.StoreUint32(&fuzzer.leakCheckReady, 1)
-			}
-			if len(r.NewInputs) == 0 && len(r.Candidates) == 0 {
+			if !fuzzer.poll(needCandidates, stats) {
 				lastPoll = time.Now()
 			}
 		}
 	}
 }
 
-func buildCallList(target *prog.Target, enabledCalls, sandbox string) map[*prog.Syscall]bool {
-	calls := make(map[*prog.Syscall]bool)
-	if enabledCalls != "" {
-		for _, id := range strings.Split(enabledCalls, ",") {
-			n, err := strconv.ParseUint(id, 10, 64)
-			if err != nil || n >= uint64(len(target.Syscalls)) {
-				panic(fmt.Sprintf("invalid syscall in -calls flag: %v", id))
-			}
-			calls[target.Syscalls[n]] = true
-		}
-	} else {
-		for _, c := range target.Syscalls {
-			calls[c] = true
-		}
+func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
+	a := &rpctype.PollArgs{
+		Name:           fuzzer.name,
+		NeedCandidates: needCandidates,
+		MaxSignal:      fuzzer.grabNewSignal().Serialize(),
+		Stats:          stats,
 	}
-
-	if supp, err := host.DetectSupportedSyscalls(target, sandbox); err != nil {
-		Logf(0, "failed to detect host supported syscalls: %v", err)
-	} else {
-		for c := range calls {
-			if !supp[c] {
-				Logf(1, "disabling unsupported syscall: %v", c.Name)
-				delete(calls, c)
-			}
-		}
+	r := &rpctype.PollRes{}
+	if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
+		log.Fatalf("Manager.Poll call failed: %v", err)
 	}
-
-	trans := target.TransitivelyEnabledCalls(calls)
-	for c := range calls {
-		if !trans[c] {
-			Logf(1, "disabling transitively unsupported syscall: %v", c.Name)
-			delete(calls, c)
-		}
+	maxSignal := r.MaxSignal.Deserialize()
+	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v",
+		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
+	fuzzer.addMaxSignal(maxSignal)
+	for _, inp := range r.NewInputs {
+		fuzzer.addInputFromAnotherFuzzer(inp)
 	}
-	return calls
+	for _, candidate := range r.Candidates {
+		p, err := fuzzer.target.Deserialize(candidate.Prog, prog.NonStrict)
+		if err != nil {
+			log.Fatalf("failed to parse program from manager: %v", err)
+		}
+		flags := ProgCandidate
+		if candidate.Minimized {
+			flags |= ProgMinimized
+		}
+		if candidate.Smashed {
+			flags |= ProgSmashed
+		}
+		fuzzer.workQueue.enqueue(&WorkCandidate{
+			p:     p,
+			flags: flags,
+		})
+	}
+	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0
 }
 
-func (fuzzer *Fuzzer) sendInputToManager(inp RPCInput) {
-	a := &NewInputArgs{
+func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.RPCInput) {
+	a := &rpctype.NewInputArgs{
 		Name:     fuzzer.name,
 		RPCInput: inp,
 	}
 	if err := fuzzer.manager.Call("Manager.NewInput", a, nil); err != nil {
-		panic(err)
+		log.Fatalf("Manager.NewInput call failed: %v", err)
 	}
 }
 
-func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp RPCInput) {
-	if !fuzzer.coverageEnabled {
-		panic("should not be called when coverage is disabled")
-	}
-	p, err := fuzzer.target.Deserialize(inp.Prog)
+func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
+	p, err := fuzzer.target.Deserialize(inp.Prog, prog.NonStrict)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to deserialize prog from another fuzzer: %v", err)
 	}
 	sig := hash.Hash(inp.Prog)
 	sign := inp.Signal.Deserialize()
@@ -485,38 +390,57 @@ func (fuzzer *Fuzzer) corpusSignalDiff(sign signal.Signal) signal.Signal {
 	return fuzzer.corpusSignal.Diff(sign)
 }
 
-func (fuzzer *Fuzzer) checkNewSignal(p *prog.Prog, info []ipc.CallInfo) (calls []int) {
+func (fuzzer *Fuzzer) checkNewSignal(p *prog.Prog, info *ipc.ProgInfo) (calls []int, extra bool) {
 	fuzzer.signalMu.RLock()
 	defer fuzzer.signalMu.RUnlock()
-	for i, inf := range info {
-		diff := fuzzer.maxSignal.DiffRaw(inf.Signal, signalPrio(p.Target, p.Calls[i], &inf))
-		if diff.Empty() {
-			continue
+	for i, inf := range info.Calls {
+		if fuzzer.checkNewCallSignal(p, &inf, i) {
+			calls = append(calls, i)
 		}
-		calls = append(calls, i)
-		fuzzer.signalMu.RUnlock()
-		fuzzer.signalMu.Lock()
-		fuzzer.maxSignal.Merge(diff)
-		fuzzer.newSignal.Merge(diff)
-		fuzzer.signalMu.Unlock()
-		fuzzer.signalMu.RLock()
 	}
+	extra = fuzzer.checkNewCallSignal(p, &info.Extra, -1)
 	return
 }
 
-func signalPrio(target *prog.Target, c *prog.Call, ci *ipc.CallInfo) (prio uint8) {
-	if ci.Errno == 0 {
+func (fuzzer *Fuzzer) checkNewCallSignal(p *prog.Prog, info *ipc.CallInfo, call int) bool {
+	diff := fuzzer.maxSignal.DiffRaw(info.Signal, signalPrio(p, info, call))
+	if diff.Empty() {
+		return false
+	}
+	fuzzer.signalMu.RUnlock()
+	fuzzer.signalMu.Lock()
+	fuzzer.maxSignal.Merge(diff)
+	fuzzer.newSignal.Merge(diff)
+	fuzzer.signalMu.Unlock()
+	fuzzer.signalMu.RLock()
+	return true
+}
+
+func signalPrio(p *prog.Prog, info *ipc.CallInfo, call int) (prio uint8) {
+	if call == -1 {
+		return 0
+	}
+	if info.Errno == 0 {
 		prio |= 1 << 1
 	}
-	if !target.CallContainsAny(c) {
+	if !p.Target.CallContainsAny(p.Calls[call]) {
 		prio |= 1 << 0
 	}
 	return
 }
 
-func (fuzzer *Fuzzer) leakCheckCallback() {
-	if atomic.LoadUint32(&fuzzer.leakCheckReady) != 0 {
-		// Scan for leaks once in a while (it is damn slow).
-		kmemleakScan(true)
+func parseOutputType(str string) OutputType {
+	switch str {
+	case "none":
+		return OutputNone
+	case "stdout":
+		return OutputStdout
+	case "dmesg":
+		return OutputDmesg
+	case "file":
+		return OutputFile
+	default:
+		log.Fatalf("-output flag must be one of none/stdout/dmesg/file")
+		return OutputNone
 	}
 }

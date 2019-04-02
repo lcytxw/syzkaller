@@ -6,6 +6,8 @@
 package rpctype
 
 import (
+	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
 )
 
@@ -27,27 +29,25 @@ type ConnectArgs struct {
 }
 
 type ConnectRes struct {
-	Prios        [][]float32
-	Inputs       []RPCInput
-	MaxSignal    signal.Serial
-	Candidates   []RPCCandidate
-	EnabledCalls string
-	NeedCheck    bool
+	EnabledCalls     []int
+	GitRevision      string
+	TargetRevision   string
+	AllSandboxes     bool
+	CheckResult      *CheckArgs
+	MemoryLeakFrames [][]byte
 }
 
 type CheckArgs struct {
-	Name           string
-	Kcov           bool
-	Leak           bool
-	Fault          bool
-	UserNamespaces bool
-	CompsSupported bool
-	Calls          []string
-	FuzzerGitRev   string
-	FuzzerSyzRev   string
-	ExecutorGitRev string
-	ExecutorSyzRev string
-	ExecutorArch   string
+	Name          string
+	Error         string
+	EnabledCalls  map[string][]int
+	DisabledCalls map[string][]SyscallReason
+	Features      *host.Features
+}
+
+type SyscallReason struct {
+	ID     int
+	Reason string
 }
 
 type NewInputArgs struct {
@@ -105,4 +105,25 @@ type HubSyncRes struct {
 	// Number of remaining pending programs,
 	// if >0 manager should do sync again.
 	More int
+}
+
+type RunTestPollReq struct {
+	Name string
+}
+
+type RunTestPollRes struct {
+	ID     int
+	Bin    []byte
+	Prog   []byte
+	Cfg    *ipc.Config
+	Opts   *ipc.ExecOpts
+	Repeat int
+}
+
+type RunTestDoneArgs struct {
+	Name   string
+	ID     int
+	Output []byte
+	Info   []*ipc.ProgInfo
+	Error  string
 }

@@ -3,6 +3,21 @@ Copyright 2017 syzkaller project authors. All rights reserved.
 Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 */}}
 
+{{/* Common page head part, invoked with *uiHeader */}}
+{{define "head"}}
+	<link rel="stylesheet" href="/static/style.css"/>
+	<script src="/static/common.js"></script>
+	{{if .AnalyticsTrackingID}}
+		<script async src="https://www.googletagmanager.com/gtag/js?id={{.AnalyticsTrackingID}}"></script>
+		<script>
+			window.dataLayer = window.dataLayer || [];
+			function gtag() { dataLayer.push(arguments); }
+			gtag('js', new Date());
+			gtag('config', '{{.AnalyticsTrackingID}}');
+		</script>
+	{{end}}
+{{end}}
+
 {{/* Common page header, invoked with *uiHeader */}}
 {{define "header"}}
 	<header id="topbar">
@@ -30,25 +45,30 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 {{if .}}
 {{if .Bugs}}
 <table class="list_table">
-	<caption>{{$.Caption}}:</caption>
+	{{if $.Fragment}}
+		<caption id="{{$.Fragment}}"><a class="plain" href="#{{$.Fragment}}">{{$.Caption}}:</a></caption>
+	{{else}}
+		<caption>{{$.Caption}}:</caption>
+	{{end}}
 	<tr>
 		{{if $.ShowNamespace}}
-			<th><a onclick="return sortTable('Kernel', textSort)" href="#">Kernel</a></th>
+			<th><a onclick="return sortTable(this, 'Kernel', textSort)" href="#">Kernel</a></th>
 		{{end}}
-		<th><a onclick="return sortTable('Title', textSort)" href="#">Title</a></th>
-		<th><a onclick="return sortTable('Repro', reproSort)" href="#">Repro</a></th>
-		<th><a onclick="return sortTable('Count', numSort)" href="#">Count</a></th>
-		<th><a onclick="return sortTable('Last', timeSort)" href="#">Last</a></th>
-		<th><a onclick="return sortTable('Reported', timeSort)" href="#">Reported</a></th>
+		<th><a onclick="return sortTable(this, 'Title', textSort)" href="#">Title</a></th>
+		<th><a onclick="return sortTable(this, 'Repro', reproSort)" href="#">Repro</a></th>
+		<th><a onclick="return sortTable(this, 'Bisected', yesSort)" href="#">Bisected</a></th>
+		<th><a onclick="return sortTable(this, 'Count', numSort)" href="#">Count</a></th>
+		<th><a onclick="return sortTable(this, 'Last', timeSort)" href="#">Last</a></th>
+		<th><a onclick="return sortTable(this, 'Reported', timeSort)" href="#">Reported</a></th>
 		{{if $.ShowPatch}}
-			<th><a onclick="return sortTable('Closed', timeSort)" href="#">Closed</a></th>
-			<th><a onclick="return sortTable('Patch', textSort)" href="#">Patch</a></th>
+			<th><a onclick="return sortTable(this, 'Closed', timeSort)" href="#">Closed</a></th>
+			<th><a onclick="return sortTable(this, 'Patch', textSort)" href="#">Patch</a></th>
 		{{end}}
 		{{if $.ShowPatched}}
-			<th><a onclick="return sortTable('Patched', patchedSort)" href="#">Patched</a></th>
+			<th><a onclick="return sortTable(this, 'Patched', patchedSort)" href="#">Patched</a></th>
 		{{end}}
 		{{if $.ShowStatus}}
-			<th><a onclick="return sortTable('Status', textSort)" href="#">Status</a></th>
+			<th><a onclick="return sortTable(this, 'Status', textSort)" href="#">Status</a></th>
 		{{end}}
 	</tr>
 	{{range $b := .Bugs}}
@@ -56,6 +76,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			{{if $.ShowNamespace}}<td>{{$b.Namespace}}</td>{{end}}
 			<td class="title"><a href="{{$b.Link}}">{{$b.Title}}</a></td>
 			<td class="stat">{{formatReproLevel $b.ReproLevel}}</td>
+			<td class="stat">{{if $b.BisectCause}}yes{{end}}</td>
 			<td class="stat {{if $b.NumCrashesBad}}bad{{end}}">{{$b.NumCrashes}}</td>
 			<td class="stat">{{formatLateness $.Now $b.LastTime}}</td>
 			<td class="stat">
@@ -67,10 +88,10 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			</td>
 			{{if $.ShowPatch}}
 				<td class="stat">{{formatLateness $.Now $b.ClosedTime}}</td>
-				<td class="title" title="{{$b.Commits}}">{{$b.Commits}}</td>
+				<td class="commit_list">{{template "fix_commits" $b.Commits}}</td>
 			{{end}}
 			{{if $.ShowPatched}}
-				<td class="patched" title="{{$b.Commits}}">{{if $b.Commits}}{{len $b.PatchedOn}}/{{$b.NumManagers}}{{end}}</td>
+				<td class="patched" {{if $b.Commits}}title="{{with $com := index $b.Commits 0}}{{$com.Title}}{{end}}"{{end}}>{{len $b.PatchedOn}}/{{$b.NumManagers}}</td>
 			{{end}}
 			{{if $.ShowStatus}}
 				<td class="status">
@@ -85,5 +106,90 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	{{end}}
 </table>
 {{end}}
+{{end}}
+{{end}}
+
+{{/* List of managers, invoked with []*uiManager */}}
+{{define "manager_list"}}
+{{if .}}
+<table class="list_table">
+	<caption id="{{(index . 0).Namespace}}-managers"><a class="plain" href="#{{(index . 0).Namespace}}-managers">Instances:</a></caption>
+	<tr>
+		<th>Name</th>
+		<th>Active</th>
+		<th>Uptime</th>
+		<th>Corpus</th>
+		<th>Coverage</th>
+		<th>Crashes</th>
+		<th>Execs</th>
+		<th colspan="3">Kernel build</th>
+		<th colspan="3">syzkaller build</th>
+	</tr>
+	<tr>
+		<th></th>
+		<th></th>
+		<th></th>
+		<th></th>
+		<th></th>
+		<th></th>
+		<th></th>
+		<th>Commit</th>
+		<th>Freshness</th>
+		<th>Status</th>
+		<th>Commit</th>
+		<th>Freshness</th>
+		<th>Status</th>
+	</tr>
+	{{range $mgr := .}}
+		<tr>
+			<td>{{link $mgr.Link $mgr.Name}}</td>
+			<td class="stat {{if $mgr.LastActiveBad}}bad{{end}}">{{formatLateness $mgr.Now $mgr.LastActive}}</td>
+			<td class="stat">{{formatDuration $mgr.CurrentUpTime}}</td>
+			<td class="stat">{{formatStat $mgr.MaxCorpus}}</td>
+			<td class="stat">
+				{{if $mgr.CoverLink}}
+					<a href="{{$mgr.CoverLink}}" target="_blank">
+				{{end}}
+				{{formatStat $mgr.MaxCover}}
+				{{if $mgr.CoverLink}}
+					</a>
+				{{end}}
+			</td>
+			<td class="stat">{{formatStat $mgr.TotalCrashes}}</td>
+			{{if $mgr.TotalExecs}}
+				<td class="stat">{{formatStat $mgr.TotalExecs}}</td>
+			{{else}}
+				<td class="stat bad">broken</td>
+			{{end}}
+			{{with $build := $mgr.CurrentBuild}}
+				<td class="stat" title="[{{$build.KernelAlias}}] {{$build.KernelCommitTitle}}">{{link $build.KernelCommitLink (formatShortHash $build.KernelCommit)}}</td>
+				<td class="stat" title="{{formatTime $build.KernelCommitDate}}" {{if $mgr.FailedBuildBugLink}}class="bad"{{end}}>{{formatLateness $mgr.Now $build.KernelCommitDate}}</td>
+				<td class="stat">{{if $mgr.FailedBuildBugLink}}<a href="{{$mgr.FailedBuildBugLink}}" class="bad">failing</a>{{end}}</td>
+				<td class="stat">{{link $build.SyzkallerCommitLink (formatShortHash $build.SyzkallerCommit)}}</td>
+				<td class="stat" title="{{formatTime $build.SyzkallerCommitDate}}" {{if $mgr.FailedSyzBuildBugLink}}class="bad"{{end}}>{{formatLateness $mgr.Now $build.SyzkallerCommitDate}}</td>
+				<td class="stat">{{if $mgr.FailedSyzBuildBugLink}}<a href="{{$mgr.FailedSyzBuildBugLink}}" class="bad">failing</a>{{end}}</td>
+			{{else}}
+				<td></td>
+				<td></td>
+				<td></td>
+				<td></td>
+				<td></td>
+				<td></td>
+			{{end}}
+		</tr>
+	{{end}}
+</table>
+{{end}}
+{{end}}
+
+{{/* List of fixing commits, invoked with []*uiCommit */}}
+{{define "fix_commits"}}
+{{range $com := .}}
+	<span class="mono">
+		{{if $com.Hash}}
+			{{formatShortHash $com.Hash}} 
+		{{end}}
+		{{link $com.Link $com.Title}}
+	</span>
 {{end}}
 {{end}}
